@@ -88,6 +88,17 @@ def test_parse_traceroute_hops() -> None:
     assert rows[3][1].reached_target
 
 
+def test_parse_traceroute_hostname_dest_uses_resolved_ips() -> None:
+    output = (
+        "traceroute to github.com (140.82.113.4), 12 hops max, 40 byte packets\n"
+        " 1  10.0.0.1  1.0 ms\n"
+        " 2  140.82.113.4  20.0 ms\n"
+    )
+    rows = parse_traceroute_output("github.com", output, dest_ips={"140.82.113.4"})
+    assert rows[1][1].reached_target
+    assert rows[1][1].responder == "140.82.113.4"
+
+
 def test_sample_store_accumulates_statistics() -> None:
     store = SampleStore()
     store.record("example.test", 1, ProbeResult("example.test", True, 10.0, "10.0.0.1"))
@@ -159,6 +170,34 @@ def test_timeline_window_filters_old_samples() -> None:
     assert len(recent) == 2
     assert recent[0].latency_ms == 12.0
     assert recent[1].latency_ms is None
+
+
+def test_endpoint_falls_back_to_ping_when_traceroute_misses_dest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SampleStore()
+    tracer = engine.ContinuousTracer("9.9.9.9", store, interval=60.0, timeout=0.5)
+
+    def fake_trace() -> list[tuple[int, engine.ProbeResult]]:
+        return [
+            (1, ProbeResult("9.9.9.9", True, 5.0, "10.0.0.1")),
+            (2, ProbeResult("9.9.9.9", True, 8.0, "10.0.0.2")),
+            (3, ProbeResult("9.9.9.9", False, error="timeout")),
+        ]
+
+    def fake_ping(host: str, timeout: float) -> ProbeResult:
+        del timeout
+        assert host == "9.9.9.9"
+        return ProbeResult(host, True, 16.0, host, reached_target=True)
+
+    monkeypatch.setattr(tracer, "_run_traceroute", fake_trace)
+    monkeypatch.setattr(engine, "ping_once", fake_ping)
+    latency = tracer._sample()
+    assert latency == 16.0
+    dest = store.hops("9.9.9.9")[-1]
+    assert dest.ip == "9.9.9.9"
+    assert dest.received >= 1
+    assert dest.last_ms == 16.0
 
 
 def test_sweeper_returns_sorted_results(monkeypatch: pytest.MonkeyPatch) -> None:

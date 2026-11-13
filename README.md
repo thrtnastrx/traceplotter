@@ -1,15 +1,12 @@
 # TracePlotter
 
-Original lab code inspired by the continuous traceroute workflow of PingPlotter. This is
-a clean-room PySide6 application, not copied or decompiled PingPlotter or Angry IP Scanner
-source.
+Inspired by Angry IP Scanner and PingPlotter, with several enhancements.
 
 ## Screenshots
 
 ### Continuous traceroute
 
-Hop table, focus bars, and rolling endpoint latency timeline for public targets
-(`1.1.1.1`, `8.8.8.8`, `9.9.9.9`, `google.com`).
+Hop table, focus bars, and rolling endpoint latency timeline with selectable times.
 
 ![TracePlotter main window](docs/screenshots/01-main-window.jpg)
 
@@ -27,7 +24,7 @@ Name and keep the current traceroute session for later.
 
 ### Subnet scan
 
-Scan an IPv4 CIDR or range, then add responders into the traceroute list.
+Scan an IPv4 CIDR or range, then add all responders, add all, or add selected IP's to continuous traceroute monitor.
 
 ![Subnet scan over TracePlotter](docs/screenshots/04-subnet-scan-overlay.jpg)
 
@@ -49,7 +46,29 @@ After a subnet scan, many hosts can be traced at once with shared hop and timeli
 - Unprivileged `/sbin/ping` and `/usr/sbin/traceroute` on macOS (no `sudo` by default)
 - `/24` default scan safety cap; `/23` and `/22` require confirmation
 
-## Run on Apple Silicon
+## macOS app (Apple Silicon)
+
+Download the latest **`TracePlotter-*-macos-arm64.zip`** from
+[Releases](https://github.com/thrtnastrx/traceplotter/releases), unzip, and move
+`TracePlotter.app` to Applications.
+
+The release build is unsigned. On first launch, right-click → **Open**, or:
+
+```bash
+xattr -cr /Applications/TracePlotter.app
+```
+
+Requires macOS 13+ on Apple Silicon.
+
+To rebuild locally:
+
+```bash
+./scripts/build-macos-app.sh
+```
+
+That writes `dist/TracePlotter.app` and `dist/TracePlotter-<version>-macos-arm64.zip`.
+
+## Run from source
 
 Install an arm64 Python 3.12+ (Homebrew or python.org), then:
 

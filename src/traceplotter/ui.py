@@ -63,6 +63,7 @@ from .engine import (
     expand_ipv4_spec,
     latency_band,
     local_subnet_suggestion,
+    resolve_ipv4,
     reverse_dns,
 )
 from .banner import DualBanner, PaneShell, ToolbarChip, default_panes_path
@@ -192,7 +193,7 @@ class HopCircleDelegate(QStyledItemDelegate):
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         theme = current_theme()
-        if option.state & QStyleOptionViewItem.StateFlag.State_Selected:
+        if option.state & QStyle.StateFlag.State_Selected:
             painter.fillRect(option.rect, QColor("#3d6ea8") if theme.key == "dark" else QColor("#dce8f8"))
         else:
             painter.fillRect(option.rect, theme.panel)
@@ -282,6 +283,13 @@ class FocusChart(QWidget):
             painter.fillRect(QRectF(body.left(), top, width, bar_h), _band_color(value))
 
 
+def _naive_local(value: datetime) -> datetime:
+    """Normalize timeline stamps so aware/naive values can be compared safely."""
+    if value.tzinfo is not None:
+        return value.astimezone().replace(tzinfo=None)
+    return value
+
+
 def clamp_timeline_view_end(
     view_end: datetime,
     *,
@@ -291,12 +299,13 @@ def clamp_timeline_view_end(
 ) -> datetime:
     """Keep the visible window ending at/before now and not before available history."""
     window = max(1.0, float(window_seconds))
-    end = min(view_end, now)
+    now_local = _naive_local(now)
+    end = min(_naive_local(view_end), now_local)
     if earliest is None:
         return end
-    min_end = earliest + timedelta(seconds=window)
-    if min_end >= now:
-        return now
+    min_end = _naive_local(earliest) + timedelta(seconds=window)
+    if min_end >= now_local:
+        return now_local
     return max(min_end, end)
 
 
@@ -324,7 +333,10 @@ class TimelineChart(QWidget):
         self.update()
 
     def set_points(self, points: list[TimelinePoint]) -> None:
-        self._points = points
+        self._points = [
+            TimelinePoint(_naive_local(point.timestamp), point.latency_ms, point.loss_percent)
+            for point in points
+        ]
         if not self._follow_live and self._view_end is not None:
             self._view_end = self._clamped_end(self._view_end)
             if self._view_end >= datetime.now() - timedelta(milliseconds=50):
@@ -532,6 +544,11 @@ class TimelineChart(QWidget):
             previous_ts = timestamp
 
 
+class ScanSignals(QObject):
+    result = Signal(object)
+    finished = Signal()
+
+
 class RemoteSubnetScanDialog(QDialog):
     add_targets = Signal(list)
 
@@ -541,7 +558,7 @@ class RemoteSubnetScanDialog(QDialog):
         hostnames: HostnameBook | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Remote Subnet Scan")
+        self.setWindowTitle("Subnet scan")
         self.resize(820, 560)
         self._results: dict[str, ProbeResult] = {}
         self._dns: dict[str, str] = {}
@@ -1002,7 +1019,7 @@ class MainWindow(QMainWindow):
         self.trace_history.setMinimumWidth(260)
         self.trace_history.currentIndexChanged.connect(self._trace_history_chosen)
         self.trace_history.delete_requested.connect(self._delete_trace_from_history)
-        scan_button = QPushButton("Remote Subnet Scan…")
+        scan_button = QPushButton("Subnet scan…")
         scan_button.clicked.connect(self.open_scan)
         self.interval = QDoubleSpinBox()
         self.interval.setRange(0.5, 60.0)
@@ -1053,6 +1070,9 @@ class MainWindow(QMainWindow):
         self.targets.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.targets.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.targets.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.targets.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.targets.setWordWrap(False)
+        self.targets.setTextElideMode(Qt.TextElideMode.ElideRight)
         header = CompactHostHeader(self.targets)
         self.targets.setHorizontalHeader(header)
         for column in range(2):
@@ -1322,10 +1342,20 @@ class MainWindow(QMainWindow):
 
     def add_targets(self, targets: Iterable[str], *, start: bool = True) -> None:
         added = 0
+        skipped: list[str] = []
         for target in targets:
             target = target.strip()
             if not target or target in self.tracers:
                 continue
+            resolved = resolve_ipv4(target)
+            if resolved is None:
+                skipped.append(target)
+                continue
+            if not self._looks_like_ipv4(target) and not self.hostnames.get(resolved):
+                try:
+                    self.hostnames.set(resolved, target)
+                except ValueError:
+                    pass
             tracer = ContinuousTracer(
                 target,
                 self.store,
@@ -1334,7 +1364,7 @@ class MainWindow(QMainWindow):
                 timeout=self.probe_timeout.value(),
             )
             self.tracers[target] = tracer
-            self._insert_target_row(target)
+            self._insert_target_row(target, resolved_ip=resolved)
             if start:
                 tracer.start()
             added += 1
@@ -1342,18 +1372,32 @@ class MainWindow(QMainWindow):
         self._paint_target_statuses()
         if self.targets.currentRow() < 0:
             self._select_first_visible_target()
-        if start:
+        if skipped:
+            QMessageBox.warning(
+                self,
+                "Could not resolve",
+                "No IPv4 address for:\n" + "\n".join(f"• {name}" for name in skipped),
+            )
+        if start and added:
             self.statusBar().showMessage(f"Started {added} target(s).")
+        elif start and not added and not skipped:
+            self.statusBar().showMessage("No new targets to start.")
 
-    def _insert_target_row(self, target: str) -> int:
+    def _insert_target_row(self, target: str, resolved_ip: str | None = None) -> int:
         row = self.targets.rowCount()
         self.targets.insertRow(row)
-        ip_item = QTableWidgetItem(target)
+        display_ip = resolved_ip or target
+        if self._looks_like_ipv4(target):
+            display_ip = target
+            name = self.hostnames.get(target) or ""
+        else:
+            name = target
+            display_ip = resolved_ip or target
+        if name == display_ip:
+            name = ""
+        ip_item = QTableWidgetItem(display_ip)
         ip_item.setData(Qt.ItemDataRole.UserRole, target)
         ip_item.setFlags(ip_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        name = self.hostnames.get(target) or ""
-        if name == target:
-            name = ""
         host_item = QTableWidgetItem(name)
         host_item.setFlags(host_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         color = QColor(current_theme().text)
@@ -1671,9 +1715,17 @@ class MainWindow(QMainWindow):
             if ip_item is None:
                 continue
             target = self._target_key(ip_item)
-            name = self.hostnames.get(target) or ""
-            if name == target:
+            tracer = self.tracers.get(target)
+            resolved = tracer.target_ip if tracer is not None else resolve_ipv4(target)
+            if self._looks_like_ipv4(target):
+                display_ip = target
+                name = self.hostnames.get(target) or ""
+            else:
+                display_ip = resolved or target
+                name = target
+            if name == display_ip:
                 name = ""
+            ip_item.setText(display_ip)
             if host_item is None:
                 host_item = QTableWidgetItem(name)
                 host_item.setFlags(host_item.flags() & ~Qt.ItemFlag.ItemIsEditable)

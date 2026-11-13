@@ -278,6 +278,8 @@ class SampleStore:
                         stamp = datetime.fromisoformat(str(row.get("timestamp")))
                     except ValueError:
                         continue
+                    if stamp.tzinfo is not None:
+                        stamp = stamp.astimezone().replace(tzinfo=None)
                     points.append(
                         TimelinePoint(
                             stamp,
@@ -343,36 +345,46 @@ def ping_once(host: str, timeout: float = 1.0, ttl: int | None = None) -> ProbeR
     return parse_ping_output(host, f"{proc.stdout}\n{proc.stderr}", proc.returncode, measured)
 
 
-def parse_traceroute_output(host: str, output: str) -> list[tuple[int, ProbeResult]]:
+def parse_traceroute_line(
+    host: str,
+    raw: str,
+    dest_ips: set[str] | None = None,
+) -> tuple[int, ProbeResult] | None:
+    """Parse one traceroute hop line, or None if the line is not a hop."""
+    match = TRACE_LINE_RE.match(raw)
+    if not match:
+        return None
+    hop = int(match.group(1))
+    rest = match.group(2).strip()
+    dest = set(dest_ips or ())
+    dest.add(host)
+    if not rest or rest.startswith("*"):
+        return hop, ProbeResult(host, False, error="timeout")
+    ip_match = re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", rest)
+    rtt_match = re.search(r"([0-9.]+)\s*ms", rest)
+    if not ip_match or not rtt_match:
+        return hop, ProbeResult(host, False, error="timeout")
+    ip = ip_match.group(1)
+    return hop, ProbeResult(
+        host=host,
+        alive=True,
+        rtt_ms=float(rtt_match.group(1)),
+        responder=ip,
+        reached_target=ip in dest,
+    )
+
+
+def parse_traceroute_output(
+    host: str,
+    output: str,
+    dest_ips: set[str] | None = None,
+) -> list[tuple[int, ProbeResult]]:
     """Parse `traceroute -n` lines into (hop, ProbeResult) pairs."""
     rows: list[tuple[int, ProbeResult]] = []
     for raw in output.splitlines():
-        match = TRACE_LINE_RE.match(raw)
-        if not match:
-            continue
-        hop = int(match.group(1))
-        rest = match.group(2).strip()
-        if not rest or rest.startswith("*"):
-            rows.append((hop, ProbeResult(host, False, error="timeout")))
-            continue
-        ip_match = re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", rest)
-        rtt_match = re.search(r"([0-9.]+)\s*ms", rest)
-        if not ip_match or not rtt_match:
-            rows.append((hop, ProbeResult(host, False, error="timeout")))
-            continue
-        ip = ip_match.group(1)
-        rows.append(
-            (
-                hop,
-                ProbeResult(
-                    host=host,
-                    alive=True,
-                    rtt_ms=float(rtt_match.group(1)),
-                    responder=ip,
-                    reached_target=(ip == host),
-                ),
-            )
-        )
+        parsed = parse_traceroute_line(host, raw, dest_ips=dest_ips)
+        if parsed is not None:
+            rows.append(parsed)
     return rows
 
 
@@ -474,18 +486,38 @@ class SubnetSweeper:
         return sorted(results, key=lambda item: int(ipaddress.IPv4Address(item.host)))
 
 
-def resolve_ipv4(host: str) -> str | None:
+def resolve_ipv4_addrs(host: str) -> list[str]:
+    """Resolve all IPv4 addresses for a host or literal address."""
+    text = host.strip()
+    if not text:
+        return []
     try:
-        infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_DGRAM)
+        ipaddress.IPv4Address(text)
+        return [text]
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(text, None, socket.AF_INET, socket.SOCK_DGRAM)
     except OSError:
-        return None
-    if not infos:
-        return None
-    return infos[0][4][0]
+        return []
+    ordered: list[str] = []
+    for info in infos:
+        ip = info[4][0]
+        if ip not in ordered:
+            ordered.append(ip)
+    return ordered
+
+
+def resolve_ipv4(host: str) -> str | None:
+    addrs = resolve_ipv4_addrs(host)
+    return addrs[0] if addrs else None
 
 
 class ContinuousTracer:
     """Continuous traceroute sampling toward the target (PingPlotter-style hops)."""
+
+    # Stop waiting on black-hole paths (common for github.com and other CDNs).
+    STAR_ABORT_AFTER = 3
 
     def __init__(
         self,
@@ -497,12 +529,14 @@ class ContinuousTracer:
         max_hops: int = 30,
     ) -> None:
         self.target = target
-        self.target_ip = resolve_ipv4(target) or target
+        self.dest_ips = set(resolve_ipv4_addrs(target))
+        self.target_ip = next(iter(self.dest_ips), target)
         self.store = store
         self.on_update = on_update
         self.interval = interval
         self.timeout = timeout
         self.max_hops = max_hops
+        self._path_ceiling: int | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -520,7 +554,19 @@ class ContinuousTracer:
     def stop(self) -> None:
         self._stop.set()
 
-    def _sample(self) -> float | None:
+    def _hop_limit(self) -> int:
+        if self._path_ceiling is None:
+            return self.max_hops
+        return max(1, min(self.max_hops, self._path_ceiling))
+
+    def _refresh_destination_ips(self) -> None:
+        resolved = set(resolve_ipv4_addrs(self.target))
+        if resolved:
+            self.dest_ips = resolved
+            self.target_ip = next(iter(resolved))
+
+    def _run_traceroute(self) -> list[tuple[int, ProbeResult]]:
+        """Stream traceroute and abort after consecutive * hops past a live path."""
         wait_s = max(1, int(round(self.timeout)))
         args = [
             TRACEROUTE,
@@ -530,18 +576,55 @@ class ContinuousTracer:
             "-w",
             str(wait_s),
             "-m",
-            str(self.max_hops),
+            str(self._hop_limit()),
             self.target,
         ]
+        rows: list[tuple[int, ProbeResult]] = []
+        star_run = 0
+        saw_responder = False
+        proc = subprocess.Popen(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        assert proc.stdout is not None
         try:
-            proc = subprocess.run(
-                args,
-                capture_output=True,
-                text=True,
-                timeout=max(8.0, self.timeout * self.max_hops + 2.0),
-            )
-            output = f"{proc.stdout}\n{proc.stderr}"
-        except (subprocess.TimeoutExpired, OSError) as exc:
+            for raw in proc.stdout:
+                if self._stop.is_set():
+                    proc.kill()
+                    break
+                parsed = parse_traceroute_line(self.target, raw, dest_ips=self.dest_ips)
+                if parsed is None:
+                    continue
+                hop, result = parsed
+                rows.append((hop, result))
+                if result.responder:
+                    saw_responder = True
+                    star_run = 0
+                    if result.responder in self.dest_ips or result.reached_target:
+                        # Destination answered — no need to probe further.
+                        proc.kill()
+                        break
+                else:
+                    star_run += 1
+                    if saw_responder and star_run >= self.STAR_ABORT_AFTER:
+                        proc.kill()
+                        break
+        except OSError:
+            proc.kill()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2)
+        return rows
+
+    def _sample(self) -> float | None:
+        self._refresh_destination_ips()
+        try:
+            rows = self._run_traceroute()
+        except OSError as exc:
             self.store.record_destination(
                 self.target,
                 self.target_ip,
@@ -556,16 +639,23 @@ class ContinuousTracer:
             return None
 
         endpoint: float | None = None
-        rows = parse_traceroute_output(self.target, output)
         if not rows:
-            echo = ping_once(self.target, self.timeout)
+            echo = ping_once(self.target_ip if self.dest_ips else self.target, self.timeout)
             dns = reverse_dns(echo.responder or self.target_ip)
             self.store.record_destination(self.target, self.target_ip, echo, dns)
             return echo.rtt_ms if echo.alive else None
 
+        responding = [hop for hop, result in rows if result.responder]
+        if responding:
+            # Keep a small cushion beyond the last live hop for the next pass.
+            self._path_ceiling = min(self.max_hops, max(responding) + self.STAR_ABORT_AFTER)
+
         reached = False
         for hop, result in rows:
-            is_dest = bool(result.responder) and result.responder in {self.target, self.target_ip}
+            # Skip * hops in the table — they only slow the UI and are not path nodes.
+            if not result.responder:
+                continue
+            is_dest = result.responder in self.dest_ips or result.reached_target
             if is_dest:
                 reached = True
                 result = ProbeResult(
@@ -579,20 +669,15 @@ class ContinuousTracer:
             if result.reached_target and result.rtt_ms is not None:
                 endpoint = result.rtt_ms
         if not reached:
-            # Destination never answered — still keep it as the final hop row.
-            miss = ProbeResult(
-                self.target,
-                False,
-                responder=self.target_ip,
-                error="timeout",
+            # Many hosts answer ICMP ping but not UDP traceroute (e.g. 9.9.9.9, github.com).
+            # Path hops still come from traceroute; endpoint up/down uses ping.
+            echo = ping_once(self.target_ip if self.dest_ips else self.target, self.timeout)
+            dns = (
+                reverse_dns(echo.responder or self.target_ip)
+                or (self.target if self.target != self.target_ip else "")
             )
-            self.store.record_destination(
-                self.target,
-                self.target_ip,
-                miss,
-                reverse_dns(self.target_ip),
-            )
-        # Do not fall back to intermediate hops — missing destination = down.
+            self.store.record_destination(self.target, self.target_ip, echo, dns)
+            endpoint = echo.rtt_ms if echo.alive else None
         return endpoint
 
     def _run(self) -> None:
