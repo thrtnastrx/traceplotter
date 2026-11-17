@@ -6,12 +6,13 @@ from pathlib import Path
 ROOT = Path(SPECPATH).resolve().parents[1]
 SRC = ROOT / "src"
 ICON = Path(SPECPATH).resolve() / "TracePlotter.icns"
+ALERT_AUDIO = SRC / "traceplotter" / "assets" / "alert_audio"
 
 a = Analysis(
     [str(Path(SPECPATH).resolve() / "entrypoint.py")],
     pathex=[str(SRC)],
     binaries=[],
-    datas=[],
+    datas=[(str(ALERT_AUDIO), "traceplotter/assets/alert_audio")] if ALERT_AUDIO.is_dir() else [],
     hiddenimports=[
         "traceplotter",
         "traceplotter.app",
@@ -23,6 +24,7 @@ a = Analysis(
         "traceplotter.scans",
         "traceplotter.hostnames",
         "traceplotter.paths",
+        "traceplotter.notifications",
         "PySide6.QtCore",
         "PySide6.QtGui",
         "PySide6.QtWidgets",
@@ -133,8 +135,8 @@ app = BUNDLE(
     info_plist={
         "CFBundleName": "TracePlotter",
         "CFBundleDisplayName": "TracePlotter",
-        "CFBundleShortVersionString": "0.1.0",
-        "CFBundleVersion": "0.1.0",
+        "CFBundleShortVersionString": "0.2.0",
+        "CFBundleVersion": "0.2.0",
         "LSMinimumSystemVersion": "13.0",
         "NSHighResolutionCapable": True,
         "NSPrincipalClass": "NSApplication",

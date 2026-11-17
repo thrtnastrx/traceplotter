@@ -212,3 +212,33 @@ def test_sweeper_returns_sorted_results(monkeypatch: pytest.MonkeyPatch) -> None
     )
     assert [item.host for item in results] == ["192.0.2.1", "192.0.2.2"]
     assert set(seen) == {"192.0.2.1", "192.0.2.2"}
+
+
+def test_parse_and_format_port_spec() -> None:
+    assert engine.parse_port_spec("80,443,8080") == [80, 443, 8080]
+    assert engine.parse_port_spec("8000-8002,22") == [8000, 8001, 8002, 22]
+    assert engine.parse_port_spec("") == []
+    assert engine.format_open_ports([443, 80, 81, 8080]) == "80-81,443,8080"
+    with pytest.raises(ValueError):
+        engine.parse_port_spec("70000")
+
+
+def test_sweeper_scans_tcp_ports(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_ping(host: str, timeout: float) -> ProbeResult:
+        del timeout
+        return ProbeResult(host, False, error="timeout")
+
+    def fake_ports(host: str, ports, timeout: float, stop_event=None):
+        del timeout, stop_event
+        if host.endswith(".1"):
+            return (80, 443)
+        return ()
+
+    monkeypatch.setattr(engine, "ping_once", fake_ping)
+    monkeypatch.setattr(engine, "scan_tcp_ports", fake_ports)
+    results = SubnetSweeper(workers=2, ports=[80, 443]).sweep(["192.0.2.1", "192.0.2.2"])
+    by_host = {item.host: item for item in results}
+    assert by_host["192.0.2.1"].alive is True
+    assert by_host["192.0.2.1"].open_ports == (80, 443)
+    assert by_host["192.0.2.2"].alive is False
+    assert by_host["192.0.2.2"].open_ports == ()

@@ -72,12 +72,12 @@ class Theme:
             }}
             #hostTargets QHeaderView::section,
             #hostTargetsHeader::section {{
-                padding: 0px 2px;
+                padding: 2px 4px;
                 margin: 0px;
-                min-height: 12px;
-                max-height: 14px;
-                font-size: 1px;
-                color: transparent;
+                min-height: 20px;
+                max-height: 24px;
+                font-size: 11px;
+                color: {self.muted};
                 border-top: none;
                 border-left: none;
                 border-right: 1px solid {self.border};
@@ -204,11 +204,19 @@ def set_theme(key: str) -> Theme:
 class Preferences:
     theme: str = "light"
     hide_unresponsive: bool = False
-    target_sort: str = "ip"  # "ip" | "hostname"
+    target_sort: str = "ip"  # "ip" | "hostname" | "manual"
     show_unresolved: bool = True
     auto_save_trace: bool = True
     host_ip_width: int = 140
     host_hostname_width: int = 120
+    host_ports_width: int = 100
+    # PingPlotter-style PlayAudioAlerts
+    audio_alerts_enabled: bool = False
+    audio_on_band_change_only: bool = True
+    audio_file_good: str = "goblet-ping.mp3"
+    audio_file_warning: str = "sonar.mp3"
+    audio_file_critical: str = "dark-church-bell.mp3"
+    audio_file_lost_packet: str = "buzzer.mp3"
 
     @classmethod
     def load(cls, path: Path | None = None) -> Preferences:
@@ -223,10 +231,12 @@ class Preferences:
         if theme not in THEMES:
             theme = "light"
         sort = str(data.get("target_sort") or "ip")
-        if sort not in ("ip", "hostname"):
+        if sort not in ("ip", "hostname", "manual"):
             sort = "ip"
         ip_width = int(data.get("host_ip_width") or 140)
         hostname_width = int(data.get("host_hostname_width") or 120)
+        ports_width = int(data.get("host_ports_width") or 100)
+        defaults = cls()
         return cls(
             theme=theme,
             hide_unresponsive=bool(data.get("hide_unresponsive", False)),
@@ -235,6 +245,15 @@ class Preferences:
             auto_save_trace=bool(data.get("auto_save_trace", True)),
             host_ip_width=max(60, ip_width),
             host_hostname_width=max(60, hostname_width),
+            host_ports_width=max(60, ports_width),
+            audio_alerts_enabled=bool(data.get("audio_alerts_enabled", False)),
+            audio_on_band_change_only=bool(data.get("audio_on_band_change_only", True)),
+            audio_file_good=str(data.get("audio_file_good") or defaults.audio_file_good),
+            audio_file_warning=str(data.get("audio_file_warning") or defaults.audio_file_warning),
+            audio_file_critical=str(data.get("audio_file_critical") or defaults.audio_file_critical),
+            audio_file_lost_packet=str(
+                data.get("audio_file_lost_packet") or defaults.audio_file_lost_packet
+            ),
         )
 
     def save(self, path: Path | None = None) -> None:
@@ -250,9 +269,28 @@ class Preferences:
                     "auto_save_trace": self.auto_save_trace,
                     "host_ip_width": self.host_ip_width,
                     "host_hostname_width": self.host_hostname_width,
+                    "host_ports_width": self.host_ports_width,
+                    "audio_alerts_enabled": self.audio_alerts_enabled,
+                    "audio_on_band_change_only": self.audio_on_band_change_only,
+                    "audio_file_good": self.audio_file_good,
+                    "audio_file_warning": self.audio_file_warning,
+                    "audio_file_critical": self.audio_file_critical,
+                    "audio_file_lost_packet": self.audio_file_lost_packet,
                 },
                 indent=2,
             )
             + "\n",
             encoding="utf-8",
+        )
+
+    def notification_settings(self):
+        from .notifications import NotificationSettings
+
+        return NotificationSettings(
+            enabled=self.audio_alerts_enabled,
+            on_band_change_only=self.audio_on_band_change_only,
+            sound_good=self.audio_file_good,
+            sound_warning=self.audio_file_warning,
+            sound_critical=self.audio_file_critical,
+            sound_lost_packet=self.audio_file_lost_packet,
         )

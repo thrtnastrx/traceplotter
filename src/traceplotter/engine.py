@@ -9,9 +9,9 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Sequence
 
 PING = "/sbin/ping"
 TRACEROUTE = "/usr/sbin/traceroute"
@@ -28,6 +28,7 @@ class ProbeResult:
     responder: str | None = None
     reached_target: bool = False
     error: str | None = None
+    open_ports: tuple[int, ...] = ()
 
 
 @dataclass
@@ -200,6 +201,14 @@ class SampleStore:
             if not points:
                 return None
             return points[-1].latency_ms is not None
+
+    def latest_endpoint_latency(self, target: str) -> tuple[bool, float | None]:
+        """Return ``(has_sample, latency_ms)`` where latency_ms is None on a lost packet."""
+        with self._lock:
+            points = self._timeline.get(target) or []
+            if not points:
+                return False, None
+            return True, points[-1].latency_ms
 
     def reset(self, target: str | None = None) -> None:
         with self._lock:
@@ -459,10 +468,125 @@ def local_subnet_suggestion() -> str:
         return "192.168.1.0/24"
 
 
+DEFAULT_TCP_PORTS = "80,443,8080"
+
+
+def parse_port_spec(spec: str) -> list[int]:
+    """Parse Angry IP–style port lists: ``80,443,8000-8002`` (commas/semicolons/whitespace)."""
+    text = (spec or "").strip()
+    if not text:
+        return []
+    ports: list[int] = []
+    seen: set[int] = set()
+    for token in re.split(r"[\s,;]+", text):
+        if not token:
+            continue
+        if "-" in token:
+            start_text, end_text = (part.strip() for part in token.split("-", 1))
+            if not start_text or not end_text:
+                raise ValueError(f"Invalid port range: {token}")
+            start, end = int(start_text), int(end_text)
+        else:
+            start = end = int(token)
+        if start > end:
+            start, end = end, start
+        if start < 1 or end > 65535:
+            raise ValueError(f"Port out of range (1–65535): {token}")
+        for port in range(start, end + 1):
+            if port not in seen:
+                seen.add(port)
+                ports.append(port)
+    return ports
+
+
+def format_open_ports(ports: Sequence[int]) -> str:
+    """Render open ports, collapsing contiguous runs (e.g. ``80,443,8000-8002``)."""
+    ordered = sorted({int(port) for port in ports})
+    if not ordered:
+        return ""
+    ranges: list[tuple[int, int]] = []
+    start = prev = ordered[0]
+    for port in ordered[1:]:
+        if port == prev + 1:
+            prev = port
+            continue
+        ranges.append((start, prev))
+        start = prev = port
+    ranges.append((start, prev))
+    parts: list[str] = []
+    for begin, finish in ranges:
+        parts.append(str(begin) if begin == finish else f"{begin}-{finish}")
+    return ",".join(parts)
+
+
+def tcp_port_open(host: str, port: int, timeout: float) -> bool:
+    """Return True when a TCP connect to ``host:port`` succeeds within ``timeout`` seconds."""
+    sock: socket.socket | None = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(max(0.05, float(timeout)))
+        sock.connect((host, int(port)))
+        return True
+    except OSError:
+        return False
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def scan_tcp_ports(
+    host: str,
+    ports: Sequence[int],
+    timeout: float,
+    stop_event: threading.Event | None = None,
+) -> tuple[int, ...]:
+    """Probe ``ports`` on ``host``; return sorted open ports."""
+    if not ports:
+        return ()
+    opened: list[int] = []
+    for port in ports:
+        if stop_event is not None and stop_event.is_set():
+            break
+        if tcp_port_open(host, port, timeout):
+            opened.append(int(port))
+    return tuple(sorted(opened))
+
+
 class SubnetSweeper:
-    def __init__(self, workers: int = 64, timeout: float = 0.8) -> None:
+    def __init__(
+        self,
+        workers: int = 64,
+        timeout: float = 0.8,
+        ports: Sequence[int] | None = None,
+        port_timeout: float | None = None,
+    ) -> None:
         self.workers = workers
         self.timeout = timeout
+        self.ports = tuple(int(port) for port in (ports or ()))
+        self.port_timeout = float(timeout if port_timeout is None else port_timeout)
+
+    def _probe_host(self, host: str, stop_event: threading.Event) -> ProbeResult:
+        result = ping_once(host, self.timeout)
+        if stop_event.is_set() or not self.ports:
+            return result
+        open_ports = scan_tcp_ports(host, self.ports, self.port_timeout, stop_event)
+        if not open_ports:
+            return replace(result, open_ports=())
+        # Open TCP ports count as alive even when ICMP is filtered (Angry IP–style).
+        if result.alive:
+            return replace(result, open_ports=open_ports)
+        return ProbeResult(
+            host=host,
+            alive=True,
+            rtt_ms=result.rtt_ms,
+            responder=host,
+            reached_target=True,
+            error=None,
+            open_ports=open_ports,
+        )
 
     def sweep(
         self,
@@ -473,7 +597,9 @@ class SubnetSweeper:
         stop_event = stop_event or threading.Event()
         results: list[ProbeResult] = []
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
-            futures = {pool.submit(ping_once, host, self.timeout): host for host in hosts}
+            futures = {
+                pool.submit(self._probe_host, host, stop_event): host for host in hosts
+            }
             for future in as_completed(futures):
                 if stop_event.is_set():
                     for pending in futures:

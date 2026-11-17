@@ -41,7 +41,9 @@ After a subnet scan, many hosts can be traced at once with shared hop and timeli
 - Multiple continuously sampled traceroute targets
 - Live hop table with sent, loss, and latency statistics
 - Rolling latency timeline (drag to scrub history; right-click to reset to live)
-- Subnet IPv4 CIDR/range scan with responder, all-host, and selected-host actions
+- Subnet IPv4 CIDR/range scan with optional TCP port probes (Angry IP–style lists) and open-ports column
+- Add scan responders, all hosts, or selected hosts into continuous traceroute
+- PingPlotter-style audio alerts (good / warning / critical / lost packet) using the same alert MP3s
 - Saved traces with load / delete from the toolbar
 - Unprivileged `/sbin/ping` and `/usr/sbin/traceroute` on macOS (no `sudo` by default)
 - `/24` default scan safety cap; `/23` and `/22` require confirmation

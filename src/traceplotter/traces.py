@@ -27,6 +27,7 @@ class SavedTrace:
     targets: list[str]
     state: dict[str, dict]
     hostnames: dict[str, str]
+    open_ports: dict[str, list[int]]
     path: Path
 
     @property
@@ -80,6 +81,7 @@ class TraceLibrary:
         targets: list[str],
         state: dict[str, dict],
         hostnames: dict[str, str] | None = None,
+        open_ports: dict[str, list[int]] | None = None,
         interval: float = 2.5,
         timeout: float = 1.0,
         time_window_seconds: int = 15 * 60,
@@ -95,6 +97,14 @@ class TraceLibrary:
             for ip, label in (hostnames or {}).items()
             if str(ip).strip() and str(ip) != "*" and str(label).strip()
         }
+        ports_out: dict[str, list[int]] = {}
+        for ip, ports in (open_ports or {}).items():
+            key = str(ip).strip()
+            if not key or key == "*":
+                continue
+            cleaned = sorted({int(port) for port in ports if int(port) > 0})
+            if cleaned:
+                ports_out[key] = cleaned
         stamp = datetime.now().astimezone()
         saved_at = stamp.isoformat(timespec="seconds")
         target_list = list(targets) or list(state)
@@ -118,6 +128,7 @@ class TraceLibrary:
             "targets": target_list,
             "state": state,
             "hostnames": dict(sorted(hostnames.items())),
+            "open_ports": dict(sorted(ports_out.items())),
         }
         path = self.last_path() if as_last else self.root / f"{trace_id}.json"
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -143,6 +154,19 @@ class TraceLibrary:
             for ip, name in raw_hostnames.items()
             if str(ip).strip() and str(name).strip()
         }
+        raw_ports = data.get("open_ports") or {}
+        open_ports: dict[str, list[int]] = {}
+        if isinstance(raw_ports, dict):
+            for ip, ports in raw_ports.items():
+                key = str(ip).strip()
+                if not key:
+                    continue
+                try:
+                    cleaned = sorted({int(port) for port in (ports or []) if int(port) > 0})
+                except (TypeError, ValueError):
+                    continue
+                if cleaned:
+                    open_ports[key] = cleaned
         targets = [str(item) for item in (data.get("targets") or []) if str(item).strip()]
         state = data.get("state") or {}
         if not isinstance(state, dict):
@@ -161,5 +185,6 @@ class TraceLibrary:
             targets=targets,
             state={str(key): value for key, value in state.items() if isinstance(value, dict)},
             hostnames=hostnames,
+            open_ports=open_ports,
             path=path,
         )

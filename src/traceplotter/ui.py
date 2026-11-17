@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QDoubleSpinBox,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -53,6 +54,7 @@ from PySide6.QtWidgets import (
 )
 
 from .engine import (
+    DEFAULT_TCP_PORTS,
     TIME_WINDOW_CHOICES,
     ContinuousTracer,
     HopStats,
@@ -61,14 +63,25 @@ from .engine import (
     SubnetSweeper,
     TimelinePoint,
     expand_ipv4_spec,
+    format_open_ports,
     latency_band,
     local_subnet_suggestion,
+    parse_port_spec,
     resolve_ipv4,
     reverse_dns,
 )
 from .banner import DualBanner, PaneShell, ToolbarChip, default_panes_path
 from .hostnames import HostnameBook
 from .scans import ScanLibrary, probe_results_from_saved
+from .notifications import (
+    EVENT_CRITICAL,
+    EVENT_GOOD,
+    EVENT_LOST,
+    EVENT_WARNING,
+    SOUND_LABELS,
+    AlertPlayer,
+    available_sounds,
+)
 from .theme import Preferences, THEMES, current_theme, set_theme
 from .traces import TraceLibrary
 
@@ -101,10 +114,63 @@ def target_sort_key(target: str, hostname: str | None, mode: str) -> tuple:
     return ip_key
 
 
-class CompactHostHeader(QHeaderView):
-    """Short unlabeled header: sort arrow + resize only (no 1/2 column numbers)."""
+class HostTargetsTable(QTableWidget):
+    """Host list with whole-row drag-and-drop reordering."""
 
-    HEADER_HEIGHT = 14
+    rows_reordered = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(0, 3, parent)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropOverwriteMode(False)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        if event.source() is not self:
+            event.ignore()
+            return
+        source_row = self.currentRow()
+        if source_row < 0:
+            event.ignore()
+            return
+        pos = event.position().toPoint()
+        dest_index = self.indexAt(pos)
+        dest_row = dest_index.row() if dest_index.isValid() else self.rowCount()
+        # Dropping on the lower half of a row inserts after it.
+        if dest_index.isValid():
+            rect = self.visualRect(dest_index)
+            if pos.y() > rect.center().y():
+                dest_row += 1
+        if dest_row > source_row:
+            dest_row -= 1
+        if dest_row == source_row or dest_row < 0:
+            event.ignore()
+            return
+        cols = self.columnCount()
+        cells: list[QTableWidgetItem | None] = []
+        for column in range(cols):
+            cells.append(self.takeItem(source_row, column))
+        height = self.rowHeight(source_row)
+        hidden = self.isRowHidden(source_row)
+        self.removeRow(source_row)
+        self.insertRow(dest_row)
+        for column, item in enumerate(cells):
+            if item is not None:
+                self.setItem(dest_row, column, item)
+        self.setRowHeight(dest_row, height)
+        self.setRowHidden(dest_row, hidden)
+        self.setCurrentCell(dest_row, 0)
+        event.accept()
+        self.rows_reordered.emit()
+
+
+class CompactHostHeader(QHeaderView):
+    """Compact host-list header with IP / Hostname / Open ports labels."""
+
+    HEADER_HEIGHT = 22
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(Qt.Orientation.Horizontal, parent)
@@ -137,7 +203,11 @@ class CompactHostHeader(QHeaderView):
         self.initStyleOption(option)
         option.rect = rect
         option.section = logical_index
-        option.text = ""
+        model = self.model()
+        if model is not None:
+            option.text = str(model.headerData(logical_index, self.orientation(), Qt.ItemDataRole.DisplayRole) or "")
+        else:
+            option.text = ""
         option.textAlignment = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
         if self.isSortIndicatorShown() and self.sortIndicatorSection() == logical_index:
             if self.sortIndicatorOrder() == Qt.SortOrder.AscendingOrder:
@@ -550,7 +620,8 @@ class ScanSignals(QObject):
 
 
 class RemoteSubnetScanDialog(QDialog):
-    add_targets = Signal(list)
+    # hosts list, then {host: [open_ports...]} discovered during the scan
+    add_targets = Signal(list, dict)
 
     def __init__(
         self,
@@ -580,11 +651,26 @@ class RemoteSubnetScanDialog(QDialog):
         self.timeout.setSingleStep(0.1)
         self.timeout.setValue(0.8)
         self.timeout.setSuffix(" s")
+        self.scan_ports = QCheckBox("Scan TCP ports")
+        self.scan_ports.setChecked(True)
+        self.ports = QLineEdit(DEFAULT_TCP_PORTS)
+        self.ports.setPlaceholderText("80,443,8080 or 22,8000-8010")
+        self.ports.setToolTip("Comma-separated TCP ports and ranges (Angry IP style). Leave empty to skip.")
+        self.port_timeout = QDoubleSpinBox()
+        self.port_timeout.setRange(0.05, 10.0)
+        self.port_timeout.setSingleStep(0.05)
+        self.port_timeout.setValue(0.4)
+        self.port_timeout.setSuffix(" s")
+        self.port_timeout.setToolTip("Per-port TCP connect timeout")
+        self.scan_ports.toggled.connect(self._ports_enabled_changed)
+        self._ports_enabled_changed(self.scan_ports.isChecked())
 
         form = QFormLayout()
         form.addRow("IPv4 CIDR or range", self.spec)
         form.addRow("Concurrent probes", self.workers)
-        form.addRow("Timeout", self.timeout)
+        form.addRow("Ping timeout", self.timeout)
+        form.addRow(self.scan_ports, self.ports)
+        form.addRow("Port timeout", self.port_timeout)
 
         self.scan_button = QPushButton("Scan")
         self.scan_button.clicked.connect(self.start_scan)
@@ -607,13 +693,17 @@ class RemoteSubnetScanDialog(QDialog):
         scan_actions.addWidget(QLabel("Previous scans"))
         scan_actions.addWidget(self.history, 1)
 
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["IP", "DNS", "RTT (ms)", "Status"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["IP", "Hostname", "Ports", "RTT (ms)", "Status"])
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSortingEnabled(True)
         self.status = QLabel("Enter any reachable remote or local IPv4 subnet.")
-
         add_responders = QPushButton("Add responders")
         add_responders.clicked.connect(lambda: self._emit_targets("responders"))
         add_all = QPushButton("Add all")
@@ -637,6 +727,10 @@ class RemoteSubnetScanDialog(QDialog):
         layout.addLayout(actions)
         self._refresh_history()
 
+    def _ports_enabled_changed(self, enabled: bool) -> None:
+        self.ports.setEnabled(enabled)
+        self.port_timeout.setEnabled(enabled)
+
     def _validated_hosts(self) -> list[str] | None:
         try:
             hosts = expand_ipv4_spec(self.spec.text(), maximum=1022)
@@ -654,9 +748,21 @@ class RemoteSubnetScanDialog(QDialog):
                 return None
         return hosts
 
+    def _validated_ports(self) -> list[int] | None:
+        if not self.scan_ports.isChecked():
+            return []
+        try:
+            return parse_port_spec(self.ports.text())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid TCP ports", str(exc))
+            return None
+
     def start_scan(self) -> None:
         hosts = self._validated_hosts()
         if hosts is None:
+            return
+        ports = self._validated_ports()
+        if ports is None:
             return
         self._stop.clear()
         self._results.clear()
@@ -666,8 +772,14 @@ class RemoteSubnetScanDialog(QDialog):
         self.scan_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.save_button.setEnabled(False)
-        self.status.setText(f"Scanning {len(hosts)} addresses…")
-        sweeper = SubnetSweeper(self.workers.value(), self.timeout.value())
+        port_note = f", {len(ports)} TCP port(s)" if ports else ""
+        self.status.setText(f"Scanning {len(hosts)} addresses{port_note}…")
+        sweeper = SubnetSweeper(
+            self.workers.value(),
+            self.timeout.value(),
+            ports=ports,
+            port_timeout=self.port_timeout.value(),
+        )
 
         def work() -> None:
             sweeper.sweep(hosts, self._signals.result.emit, self._stop)
@@ -682,7 +794,13 @@ class RemoteSubnetScanDialog(QDialog):
     def _append_result(self, result: ProbeResult) -> None:
         if result.alive and result.responder is None:
             result = ProbeResult(
-                result.host, result.alive, result.rtt_ms, result.host, result.reached_target, result.error
+                result.host,
+                result.alive,
+                result.rtt_ms,
+                result.host,
+                result.reached_target,
+                result.error,
+                result.open_ports,
             )
         self._results[result.host] = result
         discovered = reverse_dns(result.host) if result.alive else ""
@@ -694,14 +812,19 @@ class RemoteSubnetScanDialog(QDialog):
     def _insert_result_row(self, result: ProbeResult, dns: str) -> None:
         row = self.table.rowCount()
         self.table.insertRow(row)
-        values = [result.host, dns, _latency(result.rtt_ms), "Alive" if result.alive else "No reply"]
+        values = [
+            result.host,
+            dns,
+            format_open_ports(result.open_ports),
+            _latency(result.rtt_ms),
+            "Alive" if result.alive else "No reply",
+        ]
         for column, value in enumerate(values):
             item = QTableWidgetItem(value)
             item.setData(Qt.ItemDataRole.UserRole, result.host)
             if result.alive:
                 item.setForeground(QColor("#18864b"))
             self.table.setItem(row, column, item)
-
     def _scan_finished(self) -> None:
         self.scan_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
@@ -720,6 +843,7 @@ class RemoteSubnetScanDialog(QDialog):
         self.status.setText(note)
 
     def _persist_scan(self, *, as_last: bool = False, name: str | None = None):
+        ports_text = self.ports.text().strip() if self.scan_ports.isChecked() else ""
         return self._library.save(
             spec=self.spec.text().strip(),
             results=self._results,
@@ -727,6 +851,7 @@ class RemoteSubnetScanDialog(QDialog):
             hostnames=self._hostnames.snapshot(self._results.keys()),
             workers=self.workers.value(),
             timeout=self.timeout.value(),
+            ports=ports_text,
             stopped=self._stop.is_set(),
             name=name,
             as_last=as_last,
@@ -782,6 +907,12 @@ class RemoteSubnetScanDialog(QDialog):
         self.spec.setText(scan.spec)
         self.workers.setValue(scan.workers)
         self.timeout.setValue(scan.timeout)
+        if scan.ports.strip():
+            self.scan_ports.setChecked(True)
+            self.ports.setText(scan.ports)
+        else:
+            # Keep the ports field so the user can re-enable quickly.
+            self.scan_ports.setChecked(False)
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
         def host_key(host: str) -> tuple:
@@ -820,7 +951,12 @@ class RemoteSubnetScanDialog(QDialog):
         if not hosts:
             QMessageBox.information(self, "No targets", "There are no matching scan results to add.")
             return
-        self.add_targets.emit(hosts)
+        port_map = {
+            host: list(self._results[host].open_ports)
+            for host in hosts
+            if host in self._results and self._results[host].open_ports
+        }
+        self.add_targets.emit(hosts, port_map)
 
     def reject(self) -> None:
         self.stop_scan()
@@ -903,15 +1039,16 @@ class TraceHistoryCombo(QComboBox):
 
 
 class OptionsDialog(QDialog):
-    """App customization: theme and toolbar layout."""
+    """App customization: theme, toolbar layout, and PingPlotter-style audio alerts."""
 
     theme_changed = Signal(str)
 
     def __init__(self, prefs: Preferences, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Options")
-        self.resize(420, 260)
+        self.resize(520, 460)
         self.prefs = prefs
+        self._player = AlertPlayer()
 
         theme_box = QVBoxLayout()
         self.light = QRadioButton("Light")
@@ -926,6 +1063,34 @@ class OptionsDialog(QDialog):
         form = QFormLayout()
         form.addRow("Theme", theme_box)
 
+        self.audio_enabled = QCheckBox("Play audio alerts")
+        self.audio_enabled.setChecked(prefs.audio_alerts_enabled)
+        self.audio_enabled.setToolTip(
+            "PingPlotter-style endpoint sounds for good / warning / critical latency and lost packets."
+        )
+        self.audio_on_change = QCheckBox("Only when the latency band changes")
+        self.audio_on_change.setChecked(prefs.audio_on_band_change_only)
+        self.audio_on_change.setToolTip(
+            "When checked, play once when the destination moves between good/warning/critical/lost. "
+            "When unchecked, play on every sample."
+        )
+        self.sound_good = self._sound_combo(prefs.audio_file_good)
+        self.sound_warning = self._sound_combo(prefs.audio_file_warning)
+        self.sound_critical = self._sound_combo(prefs.audio_file_critical)
+        self.sound_lost = self._sound_combo(prefs.audio_file_lost_packet)
+
+        audio_form = QFormLayout()
+        audio_form.addRow(self.audio_enabled)
+        audio_form.addRow(self.audio_on_change)
+        audio_form.addRow(self._sound_row("Good (0–100 ms)", self.sound_good, EVENT_GOOD))
+        audio_form.addRow(self._sound_row("Warning (101–200 ms)", self.sound_warning, EVENT_WARNING))
+        audio_form.addRow(self._sound_row("Critical (201+ ms)", self.sound_critical, EVENT_CRITICAL))
+        audio_form.addRow(self._sound_row("Lost packet", self.sound_lost, EVENT_LOST))
+        audio_box = QGroupBox("Notifications (PingPlotter alert audio)")
+        audio_box.setLayout(audio_form)
+        self.audio_enabled.toggled.connect(self._audio_controls_enabled)
+        self._audio_controls_enabled(self.audio_enabled.isChecked())
+
         reset_toolbar = QPushButton("Reset toolbar layout")
         reset_toolbar.clicked.connect(self._reset_toolbar)
 
@@ -937,6 +1102,7 @@ class OptionsDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.addLayout(form)
+        layout.addWidget(audio_box)
         layout.addWidget(reset_toolbar)
         layout.addStretch()
         layout.addWidget(buttons)
@@ -944,8 +1110,57 @@ class OptionsDialog(QDialog):
         self.light.toggled.connect(self._preview_theme)
         self.dark.toggled.connect(self._preview_theme)
 
+    def _sound_combo(self, selected: str) -> QComboBox:
+        combo = QComboBox()
+        for name in available_sounds():
+            combo.addItem(SOUND_LABELS.get(name, name), name)
+        index = combo.findData(selected)
+        if index < 0:
+            index = 0
+        combo.setCurrentIndex(max(0, index))
+        return combo
+
+    def _sound_row(self, label: str, combo: QComboBox, event: str) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(QLabel(label))
+        layout.addWidget(combo, 1)
+        test = QPushButton("Test")
+        test.clicked.connect(lambda: self._test_sound(combo, event))
+        layout.addWidget(test)
+        return row
+
+    def _test_sound(self, combo: QComboBox, event: str) -> None:
+        filename = str(combo.currentData() or "")
+        if not self._player.play_file(filename):
+            QMessageBox.warning(
+                self,
+                "Playback failed",
+                f"Could not play {filename}. Ensure the alert audio files are installed.",
+            )
+
+    def _audio_controls_enabled(self, enabled: bool) -> None:
+        for widget in (
+            self.audio_on_change,
+            self.sound_good,
+            self.sound_warning,
+            self.sound_critical,
+            self.sound_lost,
+        ):
+            widget.setEnabled(enabled)
+
     def selected_theme(self) -> str:
         return "dark" if self.dark.isChecked() else "light"
+
+    def apply_to_prefs(self, prefs: Preferences) -> None:
+        prefs.theme = self.selected_theme()
+        prefs.audio_alerts_enabled = self.audio_enabled.isChecked()
+        prefs.audio_on_band_change_only = self.audio_on_change.isChecked()
+        prefs.audio_file_good = str(self.sound_good.currentData() or prefs.audio_file_good)
+        prefs.audio_file_warning = str(self.sound_warning.currentData() or prefs.audio_file_warning)
+        prefs.audio_file_critical = str(self.sound_critical.currentData() or prefs.audio_file_critical)
+        prefs.audio_file_lost_packet = str(self.sound_lost.currentData() or prefs.audio_file_lost_packet)
 
     def _preview_theme(self, checked: bool) -> None:
         if checked:
@@ -971,6 +1186,8 @@ class MainWindow(QMainWindow):
         self._loading_trace_history = False
         self._layout_edit = False
         self.tracers: dict[str, ContinuousTracer] = {}
+        self.open_ports: dict[str, tuple[int, ...]] = {}
+        self.alert_player = AlertPlayer()
         self.signals = MainSignals()
         self.signals.updated.connect(self._target_updated)
         self.scan_dialog: RemoteSubnetScanDialog | None = None
@@ -984,6 +1201,9 @@ class MainWindow(QMainWindow):
         stop_button.clicked.connect(self.stop_current)
         reset_button = QPushButton("Reset")
         reset_button.clicked.connect(self.reset_current)
+        clear_all_button = QPushButton("Clear all")
+        clear_all_button.setToolTip("Stop and remove all active traceroute targets")
+        clear_all_button.clicked.connect(self.clear_all_targets)
         save_trace_button = QPushButton("Save Trace…")
         save_trace_button.clicked.connect(self.save_trace)
         self.action_auto_save_trace = QAction("Auto-save last trace", self)
@@ -1006,12 +1226,17 @@ class MainWindow(QMainWindow):
         self.sort_by_ip_action.setCheckable(True)
         self.sort_by_hostname_action = QAction("Sort by hostname", self)
         self.sort_by_hostname_action.setCheckable(True)
+        self.sort_manual_action = QAction("Manual order (drag to rearrange)", self)
+        self.sort_manual_action.setCheckable(True)
         self.target_sort_group = QActionGroup(self)
         self.target_sort_group.setExclusive(True)
         self.target_sort_group.addAction(self.sort_by_ip_action)
         self.target_sort_group.addAction(self.sort_by_hostname_action)
+        self.target_sort_group.addAction(self.sort_manual_action)
         if self.prefs.target_sort == "hostname":
             self.sort_by_hostname_action.setChecked(True)
+        elif self.prefs.target_sort == "manual":
+            self.sort_manual_action.setChecked(True)
         else:
             self.sort_by_ip_action.setChecked(True)
         self.target_sort_group.triggered.connect(self._target_sort_action_triggered)
@@ -1037,6 +1262,7 @@ class MainWindow(QMainWindow):
             "add": ToolbarChip("add", add_button),
             "stop": ToolbarChip("stop", stop_button),
             "reset": ToolbarChip("reset", reset_button),
+            "clear_all": ToolbarChip("clear_all", clear_all_button),
             "save_trace": ToolbarChip("save_trace", save_trace_button),
             "trace_history": ToolbarChip(
                 "trace_history", _labeled_control("Previous traces", self.trace_history)
@@ -1051,6 +1277,7 @@ class MainWindow(QMainWindow):
                 "add",
                 "stop",
                 "reset",
+                "clear_all",
                 "save_trace",
                 "trace_history",
             ],
@@ -1060,7 +1287,7 @@ class MainWindow(QMainWindow):
         self.banner.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.banner.customContextMenuRequested.connect(self._banner_context_menu)
 
-        self.targets = QTableWidget(0, 2)
+        self.targets = HostTargetsTable(self)
         self.targets.setObjectName("hostTargets")
         self.targets.setMinimumWidth(240)
         self.targets.verticalHeader().setVisible(False)
@@ -1070,25 +1297,31 @@ class MainWindow(QMainWindow):
         self.targets.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.targets.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.targets.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.targets.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.targets.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.targets.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.targets.setWordWrap(False)
         self.targets.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.targets.setToolTip("Drag a row to rearrange hosts (switches to manual order)")
         header = CompactHostHeader(self.targets)
         self.targets.setHorizontalHeader(header)
-        for column in range(2):
-            blank = QTableWidgetItem("")
-            blank.setData(Qt.ItemDataRole.DisplayRole, "")
-            self.targets.setHorizontalHeaderItem(column, blank)
+        self.targets.setHorizontalHeaderLabels(["IP", "Hostname", "Open ports"])
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
-        header.setStretchLastSection(True)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        header.setStretchLastSection(False)
         header.resizeSection(0, self.prefs.host_ip_width)
         header.resizeSection(1, self.prefs.host_hostname_width)
+        header.resizeSection(2, self.prefs.host_ports_width)
         header.sectionResized.connect(self._host_columns_resized)
         header.sectionClicked.connect(self._host_header_clicked)
-        sort_section = 1 if self.prefs.target_sort == "hostname" else 0
-        header.setSortIndicator(sort_section, Qt.SortOrder.AscendingOrder)
+        if self.prefs.target_sort == "hostname":
+            header.setSortIndicator(1, Qt.SortOrder.AscendingOrder)
+        elif self.prefs.target_sort == "manual":
+            header.setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+        else:
+            header.setSortIndicator(0, Qt.SortOrder.AscendingOrder)
         self.targets.itemSelectionChanged.connect(self._target_selection_changed)
+        self.targets.rows_reordered.connect(self._hosts_manually_reordered)
         self.targets.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.targets.customContextMenuRequested.connect(self._target_context_menu)
         self.table = QTableWidget(0, 8)
@@ -1198,10 +1431,13 @@ class MainWindow(QMainWindow):
         dialog = OptionsDialog(self.prefs, self)
         dialog.theme_changed.connect(self.apply_theme)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.prefs.theme = dialog.selected_theme()
+            dialog.apply_to_prefs(self.prefs)
             self.prefs.save()
             self.apply_theme(self.prefs.theme)
-            self.statusBar().showMessage(f"Theme set to {THEMES[self.prefs.theme].label}.")
+            note = "on" if self.prefs.audio_alerts_enabled else "off"
+            self.statusBar().showMessage(
+                f"Options saved — theme {THEMES[self.prefs.theme].label}, audio alerts {note}."
+            )
         else:
             self.apply_theme(previous)
 
@@ -1324,6 +1560,7 @@ class MainWindow(QMainWindow):
         sort_menu = menu.addMenu("Sort hosts")
         sort_menu.addAction(self.sort_by_ip_action)
         sort_menu.addAction(self.sort_by_hostname_action)
+        sort_menu.addAction(self.sort_manual_action)
         menu.addSeparator()
         menu.addAction(change_layout)
         menu.addAction(reset_toolbar)
@@ -1340,12 +1577,26 @@ class MainWindow(QMainWindow):
             self.add_targets([value])
             self.target_input.clear()
 
-    def add_targets(self, targets: Iterable[str], *, start: bool = True) -> None:
+    def add_targets(
+        self,
+        targets: Iterable[str],
+        open_ports: dict[str, list[int]] | None = None,
+        *,
+        start: bool = True,
+    ) -> None:
+        ports_in = open_ports or {}
         added = 0
         skipped: list[str] = []
         for target in targets:
             target = target.strip()
-            if not target or target in self.tracers:
+            if not target:
+                continue
+            incoming = ports_in.get(target) or ports_in.get(resolve_ipv4(target) or "")
+            if incoming:
+                merged = set(self.open_ports.get(target, ()))
+                merged.update(int(port) for port in incoming)
+                self.open_ports[target] = tuple(sorted(merged))
+            if target in self.tracers:
                 continue
             resolved = resolve_ipv4(target)
             if resolved is None:
@@ -1356,6 +1607,8 @@ class MainWindow(QMainWindow):
                     self.hostnames.set(resolved, target)
                 except ValueError:
                     pass
+            if incoming and resolved != target:
+                self.open_ports[resolved] = self.open_ports.get(target, tuple(sorted(incoming)))
             tracer = ContinuousTracer(
                 target,
                 self.store,
@@ -1383,6 +1636,14 @@ class MainWindow(QMainWindow):
         elif start and not added and not skipped:
             self.statusBar().showMessage("No new targets to start.")
 
+    def _ports_for_target(self, target: str) -> tuple[int, ...]:
+        if target in self.open_ports:
+            return self.open_ports[target]
+        resolved = resolve_ipv4(target)
+        if resolved and resolved in self.open_ports:
+            return self.open_ports[resolved]
+        return ()
+
     def _insert_target_row(self, target: str, resolved_ip: str | None = None) -> int:
         row = self.targets.rowCount()
         self.targets.insertRow(row)
@@ -1395,16 +1656,29 @@ class MainWindow(QMainWindow):
             display_ip = resolved_ip or target
         if name == display_ip:
             name = ""
+        ports_text = format_open_ports(self._ports_for_target(target))
+        drag_flags = (
+            Qt.ItemFlag.ItemIsEnabled
+            | Qt.ItemFlag.ItemIsSelectable
+            | Qt.ItemFlag.ItemIsDragEnabled
+            | Qt.ItemFlag.ItemIsDropEnabled
+        )
         ip_item = QTableWidgetItem(display_ip)
         ip_item.setData(Qt.ItemDataRole.UserRole, target)
-        ip_item.setFlags(ip_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        ip_item.setFlags(drag_flags)
         host_item = QTableWidgetItem(name)
-        host_item.setFlags(host_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        host_item.setFlags(drag_flags)
+        ports_item = QTableWidgetItem(ports_text)
+        ports_item.setFlags(drag_flags)
+        if ports_text:
+            ports_item.setToolTip(ports_text)
         color = QColor(current_theme().text)
         ip_item.setForeground(color)
         host_item.setForeground(color)
+        ports_item.setForeground(color)
         self.targets.setItem(row, 0, ip_item)
         self.targets.setItem(row, 1, host_item)
+        self.targets.setItem(row, 2, ports_item)
         self.targets.setRowHeight(row, 24)
         return row
 
@@ -1438,12 +1712,19 @@ class MainWindow(QMainWindow):
             return False
 
     def _current_sort_mode(self) -> str:
-        return "hostname" if self.sort_by_hostname_action.isChecked() else "ip"
+        if self.sort_by_hostname_action.isChecked():
+            return "hostname"
+        if self.sort_manual_action.isChecked():
+            return "manual"
+        return "ip"
 
     def _target_sort_key_for(self, target: str) -> tuple:
         return target_sort_key(target, self.hostnames.get(target), self._current_sort_mode())
 
     def _reorder_targets(self) -> None:
+        mode = self._current_sort_mode()
+        if mode == "manual":
+            return
         current = self._current_target()
         self.targets.blockSignals(True)
         keys = [self._target_key_at(row) for row in range(self.targets.rowCount())]
@@ -1463,6 +1744,15 @@ class MainWindow(QMainWindow):
             self._select_first_visible_target()
         self.targets.blockSignals(False)
 
+    def _hosts_manually_reordered(self) -> None:
+        if not self.sort_manual_action.isChecked():
+            self.sort_manual_action.setChecked(True)
+        self.prefs.target_sort = "manual"
+        self.prefs.save()
+        self.targets.horizontalHeader().setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+        self._paint_target_statuses()
+        self.statusBar().showMessage("Host order updated (manual).")
+
     def _select_first_visible_target(self) -> None:
         for row in range(self.targets.rowCount()):
             if not self.targets.isRowHidden(row):
@@ -1474,6 +1764,8 @@ class MainWindow(QMainWindow):
             self.prefs.host_ip_width = max(60, new)
         elif index == 1:
             self.prefs.host_hostname_width = max(60, new)
+        elif index == 2:
+            self.prefs.host_ports_width = max(60, new)
         else:
             return
         self.prefs.save()
@@ -1490,6 +1782,9 @@ class MainWindow(QMainWindow):
                 self.refresh(target)
 
     def _host_header_clicked(self, section: int) -> None:
+        if section == 2:
+            # Ports column is display-only; keep current IP/hostname/manual order.
+            return
         mode = "hostname" if section == 1 else "ip"
         action = self.sort_by_hostname_action if mode == "hostname" else self.sort_by_ip_action
         if action.isChecked():
@@ -1498,16 +1793,26 @@ class MainWindow(QMainWindow):
             action.setChecked(True)
 
     def _target_sort_action_triggered(self, action: QAction) -> None:
-        mode = "hostname" if action is self.sort_by_hostname_action else "ip"
+        if action is self.sort_by_hostname_action:
+            mode = "hostname"
+        elif action is self.sort_manual_action:
+            mode = "manual"
+        else:
+            mode = "ip"
         self._apply_target_sort(mode)
 
     def _apply_target_sort(self, mode: str) -> None:
-        if mode not in ("ip", "hostname"):
+        if mode not in ("ip", "hostname", "manual"):
             mode = "ip"
         self.prefs.target_sort = mode
         self.prefs.save()
+        header = self.targets.horizontalHeader()
+        if mode == "manual":
+            header.setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+            self.statusBar().showMessage("Manual host order — drag rows to rearrange.")
+            return
         section = 1 if mode == "hostname" else 0
-        self.targets.horizontalHeader().setSortIndicator(section, Qt.SortOrder.AscendingOrder)
+        header.setSortIndicator(section, Qt.SortOrder.AscendingOrder)
         self._reorder_targets()
         self._paint_target_statuses()
 
@@ -1525,6 +1830,30 @@ class MainWindow(QMainWindow):
         if target:
             self.store.reset(target)
             self.refresh(target)
+
+    def clear_all_targets(self) -> None:
+        count = len(self.tracers)
+        if count == 0:
+            self.statusBar().showMessage("No active targets to clear.")
+            return
+        answer = QMessageBox.question(
+            self,
+            "Clear all",
+            f"Stop and remove all {count} active target(s)?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        for tracer in self.tracers.values():
+            tracer.stop()
+        self.tracers.clear()
+        self.open_ports.clear()
+        self.alert_player.reset_target()
+        self.store.reset()
+        self.targets.setRowCount(0)
+        self.refresh("")
+        self.statusBar().showMessage(f"Cleared {count} target(s).")
 
     def _time_window_changed(self, _index: int) -> None:
         seconds = int(self.time_window.currentData())
@@ -1663,6 +1992,7 @@ class MainWindow(QMainWindow):
         sort_menu = menu.addMenu("Sort hosts")
         sort_menu.addAction(self.sort_by_ip_action)
         sort_menu.addAction(self.sort_by_hostname_action)
+        sort_menu.addAction(self.sort_manual_action)
         menu.exec(self.targets.viewport().mapToGlobal(pos))
 
     def _set_hostname_for_target(self, target: str) -> None:
@@ -1697,14 +2027,27 @@ class MainWindow(QMainWindow):
 
     def open_scan(self) -> None:
         self.scan_dialog = RemoteSubnetScanDialog(self, hostnames=self.hostnames)
-        self.scan_dialog.add_targets.connect(self.add_targets)
+        self.scan_dialog.add_targets.connect(self._add_scan_targets)
         self.scan_dialog.finished.connect(lambda _code: self._paint_target_statuses())
         self.scan_dialog.show()
 
+    def _add_scan_targets(self, hosts: list, open_ports: dict | None = None) -> None:
+        self.add_targets(hosts, open_ports=open_ports or {})
+
     def _target_updated(self, target: str) -> None:
+        self._evaluate_audio_alert(target)
         self._paint_target_statuses()
         if self._current_target() == target:
             self.refresh(target)
+
+    def _evaluate_audio_alert(self, target: str) -> None:
+        has_sample, latency_ms = self.store.latest_endpoint_latency(target)
+        self.alert_player.observe_latency(
+            target,
+            latency_ms,
+            self.prefs.notification_settings(),
+            has_sample=has_sample,
+        )
 
     def _paint_target_statuses(self) -> None:
         hide_down = self.action_hide_unresponsive.isChecked()
@@ -1712,6 +2055,7 @@ class MainWindow(QMainWindow):
         for row in range(self.targets.rowCount()):
             ip_item = self.targets.item(row, 0)
             host_item = self.targets.item(row, 1)
+            ports_item = self.targets.item(row, 2)
             if ip_item is None:
                 continue
             target = self._target_key(ip_item)
@@ -1725,13 +2069,30 @@ class MainWindow(QMainWindow):
                 name = target
             if name == display_ip:
                 name = ""
+            ports_text = format_open_ports(self._ports_for_target(target))
+            drag_flags = (
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsDragEnabled
+                | Qt.ItemFlag.ItemIsDropEnabled
+            )
             ip_item.setText(display_ip)
+            ip_item.setFlags(drag_flags)
             if host_item is None:
                 host_item = QTableWidgetItem(name)
-                host_item.setFlags(host_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                host_item.setFlags(drag_flags)
                 self.targets.setItem(row, 1, host_item)
             else:
                 host_item.setText(name)
+                host_item.setFlags(drag_flags)
+            if ports_item is None:
+                ports_item = QTableWidgetItem(ports_text)
+                ports_item.setFlags(drag_flags)
+                self.targets.setItem(row, 2, ports_item)
+            else:
+                ports_item.setText(ports_text)
+                ports_item.setFlags(drag_flags)
+            ports_item.setToolTip(ports_text)
             theme = current_theme()
             up = self.store.endpoint_up(target)
             if up is True:
@@ -1743,7 +2104,7 @@ class MainWindow(QMainWindow):
             else:
                 color = QColor(theme.text)
                 bold = False
-            for cell in (ip_item, host_item):
+            for cell in (ip_item, host_item, ports_item):
                 cell.setForeground(color)
                 font = cell.font()
                 font.setBold(bold)
@@ -1818,6 +2179,14 @@ class MainWindow(QMainWindow):
                     ips.add(hop.ip)
         return self.hostnames.snapshot(ips)
 
+    def _session_open_ports(self) -> dict[str, list[int]]:
+        out: dict[str, list[int]] = {}
+        for target in self.tracers:
+            ports = self._ports_for_target(target)
+            if ports:
+                out[target] = list(ports)
+        return out
+
     def _persist_trace(self, *, as_last: bool = False, name: str | None = None):
         targets = [self._target_key_at(row) for row in range(self.targets.rowCount())]
         targets = [target for target in targets if target]
@@ -1827,6 +2196,7 @@ class MainWindow(QMainWindow):
             targets=targets,
             state=self.store.export_state(targets),
             hostnames=self._session_hostnames(),
+            open_ports=self._session_open_ports(),
             interval=self.interval.value(),
             timeout=self.probe_timeout.value(),
             time_window_seconds=self._selected_window_seconds(),
@@ -1913,7 +2283,9 @@ class MainWindow(QMainWindow):
         for tracer in self.tracers.values():
             tracer.stop()
         self.tracers.clear()
-        self.targets.clear()
+        self.open_ports.clear()
+        self.alert_player.reset_target()
+        self.targets.setRowCount(0)
         self.hostnames.merge(trace.hostnames)
         self.store.import_state(trace.state)
         self.interval.setValue(trace.interval)
@@ -1928,7 +2300,7 @@ class MainWindow(QMainWindow):
             self.time_window.setCurrentIndex(window_index)
             self.time_window.blockSignals(False)
             self.chart.set_window(trace.time_window_seconds, self.time_window.currentText())
-        self.add_targets(trace.targets, start=True)
+        self.add_targets(trace.targets, open_ports=getattr(trace, "open_ports", {}) or {}, start=True)
         if trace.selected_target:
             for row in range(self.targets.rowCount()):
                 if self._target_key_at(row) == trace.selected_target:

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "traceplotter"
-version = "0.1.0"
+version = "0.2.0"
 description = "Apple Silicon-native continuous traceroute and remote subnet scanner for the lab"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -18,6 +18,9 @@ traceplotter = "traceplotter.app:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/traceplotter"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/traceplotter/assets" = "traceplotter/assets"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

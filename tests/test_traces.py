@@ -18,6 +18,7 @@ def test_trace_round_trip(tmp_path) -> None:
         targets=["10.0.0.8"],
         state=store.export_state(["10.0.0.8"]),
         hostnames={"10.0.0.8": "core-sw"},
+        open_ports={"10.0.0.8": [443, 80]},
         interval=2.0,
         timeout=1.0,
         name="core path",
@@ -26,12 +27,14 @@ def test_trace_round_trip(tmp_path) -> None:
         targets=["10.0.0.8"],
         state=store.export_state(["10.0.0.8"]),
         hostnames={"10.0.0.8": "core-sw"},
+        open_ports={"10.0.0.8": [80, 443]},
         as_last=True,
     )
     assert last.id == LAST_TRACE_ID
     loaded = library.load(saved.id)
     assert loaded.name == "core path"
     assert loaded.hostnames["10.0.0.8"] == "core-sw"
+    assert loaded.open_ports["10.0.0.8"] == [80, 443]
     restored = SampleStore()
     targets = restored.import_state(loaded.state)
     assert targets == ["10.0.0.8"]

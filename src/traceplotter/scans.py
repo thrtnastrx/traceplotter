@@ -24,6 +24,7 @@ class SavedScan:
     saved_at: str
     workers: int
     timeout: float
+    ports: str
     stopped: bool
     results: list[dict[str, Any]]
     hostnames: dict[str, str]
@@ -86,6 +87,7 @@ class ScanLibrary:
         hostnames: dict[str, str] | None = None,
         workers: int = 64,
         timeout: float = 0.8,
+        ports: str = "",
         stopped: bool = False,
         name: str | None = None,
         as_last: bool = False,
@@ -107,6 +109,7 @@ class ScanLibrary:
             "saved_at": saved_at,
             "workers": workers,
             "timeout": timeout,
+            "ports": str(ports or ""),
             "stopped": stopped,
             "hostnames": dict(sorted(hostnames.items())),
             "results": [
@@ -117,6 +120,7 @@ class ScanLibrary:
                     "responder": result.responder,
                     "reached_target": result.reached_target,
                     "error": result.error,
+                    "open_ports": list(result.open_ports),
                     "dns": hostnames.get(host) or dns_names.get(host, ""),
                 }
                 for host, result in sorted(results.items(), key=lambda item: _host_sort_key(item[0]))
@@ -160,6 +164,7 @@ class ScanLibrary:
             saved_at=str(data.get("saved_at") or ""),
             workers=int(data.get("workers") or 64),
             timeout=float(data.get("timeout") or 0.8),
+            ports=str(data.get("ports") or ""),
             stopped=bool(data.get("stopped")),
             results=list(data.get("results") or []),
             hostnames=hostnames,
@@ -172,6 +177,8 @@ def probe_results_from_saved(scan: SavedScan) -> tuple[dict[str, ProbeResult], d
     dns_names: dict[str, str] = {}
     for row in scan.results:
         host = str(row["host"])
+        raw_ports = row.get("open_ports") or []
+        open_ports = tuple(int(port) for port in raw_ports if str(port).strip())
         results[host] = ProbeResult(
             host=host,
             alive=bool(row.get("alive")),
@@ -179,6 +186,7 @@ def probe_results_from_saved(scan: SavedScan) -> tuple[dict[str, ProbeResult], d
             responder=row.get("responder"),
             reached_target=bool(row.get("reached_target")),
             error=row.get("error"),
+            open_ports=open_ports,
         )
         dns_names[host] = scan.hostnames.get(host) or str(row.get("dns") or "")
     return results, dns_names
