@@ -1,12 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
 """PyInstaller spec for TracePlotter.app (macOS arm64)."""
 
+import tomllib
 from pathlib import Path
 
 ROOT = Path(SPECPATH).resolve().parents[1]
 SRC = ROOT / "src"
 ICON = Path(SPECPATH).resolve() / "TracePlotter.icns"
 ALERT_AUDIO = SRC / "traceplotter" / "assets" / "alert_audio"
+VERSION = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"][
+    "version"
+]
 
 a = Analysis(
     [str(Path(SPECPATH).resolve() / "entrypoint.py")],
@@ -135,8 +139,8 @@ app = BUNDLE(
     info_plist={
         "CFBundleName": "TracePlotter",
         "CFBundleDisplayName": "TracePlotter",
-        "CFBundleShortVersionString": "0.2.1",
-        "CFBundleVersion": "0.2.1",
+        "CFBundleShortVersionString": VERSION,
+        "CFBundleVersion": VERSION,
         "LSMinimumSystemVersion": "13.0",
         "NSHighResolutionCapable": True,
         "NSPrincipalClass": "NSApplication",
