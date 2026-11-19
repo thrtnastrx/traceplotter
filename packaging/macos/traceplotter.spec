@@ -135,8 +135,8 @@ app = BUNDLE(
     info_plist={
         "CFBundleName": "TracePlotter",
         "CFBundleDisplayName": "TracePlotter",
-        "CFBundleShortVersionString": "0.2.0",
-        "CFBundleVersion": "0.2.0",
+        "CFBundleShortVersionString": "0.2.1",
+        "CFBundleVersion": "0.2.1",
         "LSMinimumSystemVersion": "13.0",
         "NSHighResolutionCapable": True,
         "NSPrincipalClass": "NSApplication",

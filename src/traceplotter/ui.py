@@ -73,6 +73,7 @@ from .engine import (
 from .banner import DualBanner, PaneShell, ToolbarChip, default_panes_path
 from .hostnames import HostnameBook
 from .scans import ScanLibrary, probe_results_from_saved
+from . import app_version
 from .notifications import (
     EVENT_CRITICAL,
     EVENT_GOOD,
@@ -84,6 +85,9 @@ from .notifications import (
 )
 from .theme import Preferences, THEMES, current_theme, set_theme
 from .traces import TraceLibrary
+
+APP_NAME = "TracePlotter"
+APP_URL = "https://github.com/thrtnastrx/traceplotter"
 
 
 def _labeled_control(label: str, widget: QWidget) -> QWidget:
@@ -1038,6 +1042,46 @@ class TraceHistoryCombo(QComboBox):
         return super().eventFilter(watched, event)
 
 
+class AboutDialog(QDialog):
+    """About TracePlotter."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"About {APP_NAME}")
+        self.setMinimumWidth(420)
+        version = app_version()
+        title = QLabel(APP_NAME)
+        title_font = QFont(title.font())
+        title_font.setPointSize(18)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        version_label = QLabel(f"Version {version}")
+        version_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        body = QLabel(
+            "Continuous traceroute and remote subnet scanner for Apple Silicon.\n"
+            "Inspired by Angry IP Scanner and PingPlotter, with several enhancements.\n\n"
+            "Hop monitoring, subnet TCP port scan, saved traces, and PingPlotter-style "
+            "audio alerts."
+        )
+        body.setWordWrap(True)
+        body.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        link = QLabel(f'<a href="{APP_URL}">{APP_URL}</a>')
+        link.setOpenExternalLinks(True)
+        link.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        buttons.accepted.connect(self.accept)
+        layout = QVBoxLayout(self)
+        layout.addWidget(title)
+        layout.addWidget(version_label)
+        layout.addSpacing(8)
+        layout.addWidget(body)
+        layout.addSpacing(8)
+        layout.addWidget(link)
+        layout.addStretch()
+        layout.addWidget(buttons)
+
+
 class OptionsDialog(QDialog):
     """App customization: theme, toolbar layout, and PingPlotter-style audio alerts."""
 
@@ -1046,7 +1090,7 @@ class OptionsDialog(QDialog):
     def __init__(self, prefs: Preferences, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Options")
-        self.resize(520, 460)
+        self.resize(520, 500)
         self.prefs = prefs
         self._player = AlertPlayer()
 
@@ -1093,6 +1137,8 @@ class OptionsDialog(QDialog):
 
         reset_toolbar = QPushButton("Reset toolbar layout")
         reset_toolbar.clicked.connect(self._reset_toolbar)
+        about_button = QPushButton("About…")
+        about_button.clicked.connect(self._open_about)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -1100,10 +1146,15 @@ class OptionsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
+        extras = QHBoxLayout()
+        extras.addWidget(reset_toolbar)
+        extras.addWidget(about_button)
+        extras.addStretch()
+
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addWidget(audio_box)
-        layout.addWidget(reset_toolbar)
+        layout.addLayout(extras)
         layout.addStretch()
         layout.addWidget(buttons)
 
@@ -1172,11 +1223,14 @@ class OptionsDialog(QDialog):
             parent.banner.reset_layout()
             QMessageBox.information(self, "Toolbar", "Toolbar layout reset to defaults.")
 
+    def _open_about(self) -> None:
+        AboutDialog(self).exec()
+
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("TracePlotter")
+        self.setWindowTitle(APP_NAME)
         self.resize(1280, 780)
         self.prefs = Preferences.load()
         set_theme(self.prefs.theme)
@@ -1408,12 +1462,31 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.banner, 0)
         layout.addWidget(self.main_splitter, 1)
         self.setCentralWidget(center)
+        self._build_menus()
         self.apply_theme(self.prefs.theme)
         self.set_layout_edit(False)
         self.statusBar().showMessage(
             "Ready — continuous traceroute samples (green ≤100 ms, yellow ≤200, red 201+)."
         )
         self._refresh_trace_history()
+
+    def _build_menus(self) -> None:
+        """App menu bar; on macOS About/Options move into the TracePlotter application menu."""
+        self.action_about = QAction(f"About {APP_NAME}", self)
+        self.action_about.setMenuRole(QAction.MenuRole.AboutRole)
+        self.action_about.triggered.connect(self.open_about)
+
+        self.action_options = QAction("Options…", self)
+        self.action_options.setMenuRole(QAction.MenuRole.PreferencesRole)
+        self.action_options.setShortcut("Ctrl+,")
+        self.action_options.triggered.connect(self.open_options)
+
+        menubar = self.menuBar()
+        app_menu = menubar.addMenu(APP_NAME)
+        app_menu.addAction(self.action_about)
+        app_menu.addAction(self.action_options)
+        help_menu = menubar.addMenu("Help")
+        help_menu.addAction(self.action_about)
 
     def apply_theme(self, key: str) -> None:
         theme = set_theme(key)
@@ -1425,6 +1498,9 @@ class MainWindow(QMainWindow):
         current = self._current_target()
         if current:
             self.refresh(current)
+
+    def open_about(self) -> None:
+        AboutDialog(self).exec()
 
     def open_options(self) -> None:
         previous = self.prefs.theme
@@ -1542,8 +1618,6 @@ class MainWindow(QMainWindow):
 
     def _banner_context_menu(self, pos) -> None:
         menu = QMenu(self)
-        options = QAction("Options…", self)
-        options.triggered.connect(self.open_options)
         change_layout = QAction("Change layout", self)
         change_layout.setCheckable(True)
         change_layout.setChecked(self._layout_edit)
@@ -1552,7 +1626,8 @@ class MainWindow(QMainWindow):
         reset_toolbar.triggered.connect(self.banner.reset_layout)
         reset_panes = QAction("Reset pane layout", self)
         reset_panes.triggered.connect(self._reset_pane_layout)
-        menu.addAction(options)
+        menu.addAction(self.action_options)
+        menu.addAction(self.action_about)
         menu.addSeparator()
         menu.addAction(self.action_show_unresolved)
         menu.addAction(self.action_hide_unresponsive)
@@ -2330,7 +2405,11 @@ class MainWindow(QMainWindow):
 
 def run() -> int:
     app = QApplication.instance() or QApplication([])
-    app.setApplicationName("TracePlotter")
+    app.setApplicationName(APP_NAME)
+    app.setApplicationDisplayName(APP_NAME)
+    app.setOrganizationName("thrtnastrx")
+    app.setOrganizationDomain("thrtnastrx.com")
+    app.setApplicationVersion(app_version())
     app.setStyle("Fusion")
     window = MainWindow()
     window.show()
