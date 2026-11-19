@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,7 +40,9 @@ EVENT_WARNING = "warning"
 EVENT_CRITICAL = "critical"
 EVENT_LOST = "lost_packet"
 
-AUDIO_INDICATOR = "♪"
+# Speaker icon (cone) shown next to a host only while its alert sound is playing.
+# Prefer the plain speaker over the multi-wave "sound" glyph.
+AUDIO_INDICATOR = "🔈"
 
 
 def alert_audio_dir() -> Path:
@@ -123,10 +126,15 @@ class NotificationSettings:
 class AlertPlayer:
     """Play PingPlotter alert MP3s via macOS ``afplay`` (no QtMultimedia dependency)."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        on_playback_changed: Callable[[str | None], None] | None = None,
+    ) -> None:
         self._lock = threading.Lock()
         self._last_event_by_target: dict[str, str] = {}
         self._proc: subprocess.Popen | None = None
+        self._playing_target: str | None = None
+        self._on_playback_changed = on_playback_changed
 
     def reset_target(self, target: str | None = None) -> None:
         with self._lock:
@@ -134,6 +142,15 @@ class AlertPlayer:
                 self._last_event_by_target.clear()
             else:
                 self._last_event_by_target.pop(target, None)
+
+    def playing_target(self) -> str | None:
+        with self._lock:
+            if self._proc is not None and self._proc.poll() is None:
+                return self._playing_target
+            return None
+
+    def is_playing(self, target: str) -> bool:
+        return bool(target) and self.playing_target() == target
 
     def observe_latency(
         self,
@@ -161,15 +178,21 @@ class AlertPlayer:
             # Healthy first sample establishes baseline without a chime.
             # Warning / critical / lost still alert immediately (e.g. already-down host).
             return None
-        self.play_event(event, settings)
+        self.play_event(event, settings, target=target)
         return event
 
-    def play_event(self, event: str, settings: NotificationSettings) -> bool:
+    def play_event(
+        self,
+        event: str,
+        settings: NotificationSettings,
+        *,
+        target: str | None = None,
+    ) -> bool:
         if not settings.event_enabled(event):
             return False
-        return self.play_file(settings.sound_for_event(event))
+        return self.play_file(settings.sound_for_event(event), target=target)
 
-    def play_file(self, filename: str) -> bool:
+    def play_file(self, filename: str, *, target: str | None = None) -> bool:
         path = sound_path(filename)
         if path is None:
             return False
@@ -183,12 +206,46 @@ class AlertPlayer:
                 except OSError:
                     pass
             try:
-                self._proc = subprocess.Popen(
+                proc = subprocess.Popen(
                     [afplay, str(path)],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
             except OSError:
                 self._proc = None
+                self._playing_target = None
+                self._notify_playback_changed(None)
                 return False
+            self._proc = proc
+            self._playing_target = target
+        self._notify_playback_changed(target)
+        threading.Thread(
+            target=self._watch_proc,
+            args=(proc,),
+            daemon=True,
+            name="traceplotter-afplay-watch",
+        ).start()
         return True
+
+    def _watch_proc(self, proc: subprocess.Popen) -> None:
+        try:
+            proc.wait()
+        except OSError:
+            pass
+        cleared = False
+        with self._lock:
+            if self._proc is proc:
+                self._proc = None
+                self._playing_target = None
+                cleared = True
+        if cleared:
+            self._notify_playback_changed(None)
+
+    def _notify_playback_changed(self, target: str | None) -> None:
+        callback = self._on_playback_changed
+        if callback is None:
+            return
+        try:
+            callback(target)
+        except Exception:
+            pass

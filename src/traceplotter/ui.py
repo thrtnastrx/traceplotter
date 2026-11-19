@@ -975,6 +975,7 @@ class RemoteSubnetScanDialog(QDialog):
 
 class MainSignals(QObject):
     updated = Signal(str)
+    audio_playback_changed = Signal(object)  # playing target str | None
 
 
 class TraceHistoryDelegate(QStyledItemDelegate):
@@ -1371,9 +1372,13 @@ class MainWindow(QMainWindow):
         self._layout_edit = False
         self.tracers: dict[str, ContinuousTracer] = {}
         self.open_ports: dict[str, tuple[int, ...]] = {}
-        self.alert_player = AlertPlayer()
         self.signals = MainSignals()
+        self.alert_player = AlertPlayer(
+            on_playback_changed=self.signals.audio_playback_changed.emit
+        )
         self.signals.updated.connect(self._target_updated)
+        self.signals.audio_playback_changed.connect(self._audio_playback_changed)
+        self._audio_indicator_target: str | None = None
         self.scan_dialog: RemoteSubnetScanDialog | None = None
 
         self.target_input = QLineEdit()
@@ -1746,9 +1751,34 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Audio alerts removed from {removed} target(s).")
 
     def _ip_display_text(self, display_ip: str, target: str) -> str:
-        if self.target_audio_armed(target):
+        if self.alert_player.is_playing(target) or self._audio_indicator_target == target:
             return f"{AUDIO_INDICATOR} {display_ip}"
         return display_ip
+
+    def _audio_playback_changed(self, target: object) -> None:
+        playing = str(target) if target else None
+        previous = self._audio_indicator_target
+        self._audio_indicator_target = playing
+        if previous == playing:
+            return
+        # Lightweight IP-column refresh for the hosts that gained/lost the speaker icon.
+        for row in range(self.targets.rowCount()):
+            ip_item = self.targets.item(row, 0)
+            if ip_item is None:
+                continue
+            key = self._target_key(ip_item)
+            if key not in {previous, playing}:
+                continue
+            if self._looks_like_ipv4(key):
+                display_ip = key
+            else:
+                tracer = self.tracers.get(key)
+                display_ip = (tracer.target_ip if tracer is not None else None) or key
+            ip_item.setText(self._ip_display_text(display_ip, key))
+            if self.alert_player.is_playing(key):
+                ip_item.setToolTip("Playing audio alert")
+            else:
+                ip_item.setToolTip("")
 
     def set_layout_edit(self, enabled: bool) -> None:
         self._layout_edit = enabled
@@ -1974,8 +2004,8 @@ class MainWindow(QMainWindow):
         ip_item = QTableWidgetItem(self._ip_display_text(display_ip, target))
         ip_item.setData(Qt.ItemDataRole.UserRole, target)
         ip_item.setFlags(drag_flags)
-        if self.target_audio_armed(target):
-            ip_item.setToolTip("Audio alerts armed for this target")
+        if self.alert_player.is_playing(target):
+            ip_item.setToolTip("Playing audio alert")
         host_item = QTableWidgetItem(name)
         host_item.setFlags(drag_flags)
         ports_item = QTableWidgetItem(ports_text)
@@ -1995,11 +2025,12 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _strip_audio_indicator(text: str) -> str:
         value = text.strip()
-        prefix = f"{AUDIO_INDICATOR} "
-        if value.startswith(prefix):
-            return value[len(prefix) :].strip()
-        if value.startswith(AUDIO_INDICATOR):
-            return value[len(AUDIO_INDICATOR) :].strip()
+        for marker in (AUDIO_INDICATOR, "♪", "🔊"):
+            prefix = f"{marker} "
+            if value.startswith(prefix):
+                return value[len(prefix) :].strip()
+            if value.startswith(marker):
+                return value[len(marker) :].strip()
         return value
 
     def _target_key(self, item: QTableWidgetItem | None) -> str:
@@ -2440,8 +2471,8 @@ class MainWindow(QMainWindow):
             ip_item.setText(self._ip_display_text(display_ip, target))
             ip_item.setData(Qt.ItemDataRole.UserRole, target)
             ip_item.setFlags(drag_flags)
-            if self.target_audio_armed(target):
-                ip_item.setToolTip("Audio alerts armed — ♪ shows this target can trigger sounds")
+            if self.alert_player.is_playing(target):
+                ip_item.setToolTip("Playing audio alert")
             else:
                 ip_item.setToolTip("")
             if host_item is None:

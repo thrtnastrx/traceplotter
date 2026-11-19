@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "traceplotter"
-version = "0.2.2"
+version = "0.2.3"
 description = "Apple Silicon-native continuous traceroute and remote subnet scanner for the lab"
 readme = "README.md"
 requires-python = ">=3.12"

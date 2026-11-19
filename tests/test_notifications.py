@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import threading
+import time
+
 from traceplotter.engine import set_band_thresholds
 from traceplotter.notifications import (
     EVENT_CRITICAL,
@@ -48,7 +51,8 @@ def test_observe_latency_plays_on_band_change_only() -> None:
     # None = all targets armed.
     settings = NotificationSettings(enabled=True, on_band_change_only=True, armed_targets=None)
 
-    def fake_play(event: str, _settings: NotificationSettings) -> bool:
+    def fake_play(event: str, _settings: NotificationSettings, *, target: str | None = None) -> bool:
+        del target
         played.append(event)
         return True
 
@@ -67,7 +71,8 @@ def test_observe_latency_requires_armed_target_when_selective() -> None:
     played: list[str] = []
     settings = NotificationSettings(enabled=True, armed_targets=set())
 
-    def fake_play(event: str, _settings: NotificationSettings) -> bool:
+    def fake_play(event: str, _settings: NotificationSettings, *, target: str | None = None) -> bool:
+        del target
         played.append(event)
         return True
 
@@ -82,13 +87,60 @@ def test_lost_packet_alerts_on_first_sample() -> None:
     played: list[str] = []
     settings = NotificationSettings(enabled=True, on_band_change_only=True, armed_targets=None)
 
-    def fake_play(event: str, _settings: NotificationSettings) -> bool:
+    def fake_play(event: str, _settings: NotificationSettings, *, target: str | None = None) -> bool:
+        del target
         played.append(event)
         return True
 
     player.play_event = fake_play  # type: ignore[method-assign]
     assert player.observe_latency("1.1.1.1", None, settings, has_sample=True) == EVENT_LOST
     assert played == [EVENT_LOST]
+
+
+def test_play_file_tracks_playing_target_until_process_ends(monkeypatch) -> None:
+    player = AlertPlayer()
+    changes: list[str | None] = []
+    player._on_playback_changed = changes.append  # type: ignore[method-assign]
+    release = threading.Event()
+
+    class FakeProc:
+        def __init__(self) -> None:
+            self._ended = False
+
+        def poll(self):
+            return 0 if self._ended else None
+
+        def terminate(self) -> None:
+            self._ended = True
+            release.set()
+
+        def wait(self) -> int:
+            release.wait(timeout=2.0)
+            self._ended = True
+            return 0
+
+    fake = FakeProc()
+
+    def fake_popen(*_args, **_kwargs):
+        return fake
+
+    monkeypatch.setattr("traceplotter.notifications.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("traceplotter.notifications.shutil.which", lambda _name: "/usr/bin/afplay")
+    monkeypatch.setattr(
+        "traceplotter.notifications.sound_path",
+        lambda _name: __import__("pathlib").Path("/tmp/buzzer.mp3"),
+    )
+
+    assert player.play_file("buzzer.mp3", target="1.1.1.1") is True
+    assert player.is_playing("1.1.1.1") is True
+    assert changes[-1] == "1.1.1.1"
+    release.set()
+    for _ in range(50):
+        if not player.is_playing("1.1.1.1"):
+            break
+        time.sleep(0.02)
+    assert player.playing_target() is None
+    assert changes[-1] is None
 
 
 def test_observe_latency_respects_per_event_toggles() -> None:
@@ -102,7 +154,8 @@ def test_observe_latency_respects_per_event_toggles() -> None:
         armed_targets={"1.1.1.1"},
     )
 
-    def fake_play(event: str, _settings: NotificationSettings) -> bool:
+    def fake_play(event: str, _settings: NotificationSettings, *, target: str | None = None) -> bool:
+        del target
         played.append(event)
         return True
 
