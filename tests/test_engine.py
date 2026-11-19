@@ -13,9 +13,11 @@ from traceplotter.engine import (
     SubnetSweeper,
     TimelinePoint,
     expand_ipv4_spec,
+    latency_band,
     loss_percent,
     parse_ping_output,
     parse_traceroute_output,
+    set_band_thresholds,
 )
 
 
@@ -46,6 +48,20 @@ def test_scan_cap_allows_22_and_rejects_larger() -> None:
 )
 def test_loss_math(sent: int, received: int, expected: float) -> None:
     assert loss_percent(sent, received) == expected
+
+
+def test_latency_band_uses_thresholds() -> None:
+    set_band_thresholds(100, 200)
+    assert latency_band(100) == "green"
+    assert latency_band(101) == "yellow"
+    assert latency_band(201) == "red"
+    assert latency_band(None) == "none"
+    assert latency_band(75, green_max_ms=50, yellow_max_ms=90) == "yellow"
+    set_band_thresholds(40, 90)
+    assert latency_band(40) == "green"
+    assert latency_band(41) == "yellow"
+    assert latency_band(91) == "red"
+    set_band_thresholds(100, 200)
 
 
 def test_parse_successful_ping() -> None:

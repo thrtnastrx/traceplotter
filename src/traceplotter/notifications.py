@@ -39,6 +39,8 @@ EVENT_WARNING = "warning"
 EVENT_CRITICAL = "critical"
 EVENT_LOST = "lost_packet"
 
+AUDIO_INDICATOR = "♪"
+
 
 def alert_audio_dir() -> Path:
     """Return the directory that holds bundled PingPlotter alert MP3s."""
@@ -85,10 +87,24 @@ def event_for_latency(ms: float | None) -> str:
 class NotificationSettings:
     enabled: bool = False
     on_band_change_only: bool = True
+    event_good: bool = True
+    event_warning: bool = True
+    event_critical: bool = True
+    event_lost_packet: bool = True
     sound_good: str = DEFAULT_SOUND_GOOD
     sound_warning: str = DEFAULT_SOUND_WARNING
     sound_critical: str = DEFAULT_SOUND_CRITICAL
     sound_lost_packet: str = DEFAULT_SOUND_LOST
+    # None = every target; empty set = none; otherwise only listed targets.
+    armed_targets: set[str] | None = None
+
+    def event_enabled(self, event: str) -> bool:
+        return {
+            EVENT_GOOD: self.event_good,
+            EVENT_WARNING: self.event_warning,
+            EVENT_CRITICAL: self.event_critical,
+            EVENT_LOST: self.event_lost_packet,
+        }.get(event, False)
 
     def sound_for_event(self, event: str) -> str:
         return {
@@ -97,6 +113,11 @@ class NotificationSettings:
             EVENT_CRITICAL: self.sound_critical,
             EVENT_LOST: self.sound_lost_packet,
         }.get(event, self.sound_lost_packet)
+
+    def target_armed(self, target: str) -> bool:
+        if self.armed_targets is None:
+            return True
+        return target in self.armed_targets
 
 
 class AlertPlayer:
@@ -123,21 +144,29 @@ class AlertPlayer:
         has_sample: bool,
     ) -> str | None:
         """Evaluate endpoint latency and play when configured. Returns fired event or None."""
-        if not settings.enabled or not has_sample:
+        if not settings.enabled or not has_sample or not settings.target_armed(target):
             return None
         event = event_for_latency(latency_ms)
+        if not settings.event_enabled(event):
+            # Still track band so re-enabling an event does not spam immediately.
+            with self._lock:
+                self._last_event_by_target[target] = event
+            return None
         with self._lock:
             previous = self._last_event_by_target.get(target)
             self._last_event_by_target[target] = event
         if settings.on_band_change_only and previous == event:
             return None
-        if previous is None and settings.on_band_change_only:
-            # First sample establishes baseline without an immediate sound.
+        if previous is None and settings.on_band_change_only and event == EVENT_GOOD:
+            # Healthy first sample establishes baseline without a chime.
+            # Warning / critical / lost still alert immediately (e.g. already-down host).
             return None
         self.play_event(event, settings)
         return event
 
     def play_event(self, event: str, settings: NotificationSettings) -> bool:
+        if not settings.event_enabled(event):
+            return False
         return self.play_file(settings.sound_for_event(event))
 
     def play_file(self, filename: str) -> bool:

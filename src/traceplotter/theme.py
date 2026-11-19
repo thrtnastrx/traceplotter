@@ -210,13 +210,22 @@ class Preferences:
     host_ip_width: int = 140
     host_hostname_width: int = 120
     host_ports_width: int = 100
+    # Time-graph / alert latency bands (ms). Red is anything above yellow_max.
+    band_green_max_ms: float = 100.0
+    band_yellow_max_ms: float = 200.0
     # PingPlotter-style PlayAudioAlerts
     audio_alerts_enabled: bool = False
     audio_on_band_change_only: bool = True
+    audio_event_good: bool = True
+    audio_event_warning: bool = True
+    audio_event_critical: bool = True
+    audio_event_lost_packet: bool = True
     audio_file_good: str = "goblet-ping.mp3"
     audio_file_warning: str = "sonar.mp3"
     audio_file_critical: str = "dark-church-bell.mp3"
     audio_file_lost_packet: str = "buzzer.mp3"
+    # None = all targets; [] = none; otherwise only listed keys.
+    audio_alert_targets: list[str] | None = None
 
     @classmethod
     def load(cls, path: Path | None = None) -> Preferences:
@@ -237,6 +246,24 @@ class Preferences:
         hostname_width = int(data.get("host_hostname_width") or 120)
         ports_width = int(data.get("host_ports_width") or 100)
         defaults = cls()
+        green_max = float(data.get("band_green_max_ms", defaults.band_green_max_ms))
+        yellow_max = float(data.get("band_yellow_max_ms", defaults.band_yellow_max_ms))
+        if green_max < 1:
+            green_max = defaults.band_green_max_ms
+        if yellow_max <= green_max:
+            yellow_max = green_max + max(1.0, defaults.band_yellow_max_ms - defaults.band_green_max_ms)
+        # Missing key → all targets (legacy / master-only config).
+        # Explicit null → all. Explicit list (including empty) → that selection.
+        if "audio_alert_targets" not in data or data.get("audio_alert_targets") is None:
+            audio_targets: list[str] | None = None
+        elif isinstance(data.get("audio_alert_targets"), list):
+            audio_targets = [
+                str(item).strip()
+                for item in data["audio_alert_targets"]
+                if str(item).strip()
+            ]
+        else:
+            audio_targets = None
         return cls(
             theme=theme,
             hide_unresponsive=bool(data.get("hide_unresponsive", False)),
@@ -246,19 +273,27 @@ class Preferences:
             host_ip_width=max(60, ip_width),
             host_hostname_width=max(60, hostname_width),
             host_ports_width=max(60, ports_width),
+            band_green_max_ms=green_max,
+            band_yellow_max_ms=yellow_max,
             audio_alerts_enabled=bool(data.get("audio_alerts_enabled", False)),
             audio_on_band_change_only=bool(data.get("audio_on_band_change_only", True)),
+            audio_event_good=bool(data.get("audio_event_good", True)),
+            audio_event_warning=bool(data.get("audio_event_warning", True)),
+            audio_event_critical=bool(data.get("audio_event_critical", True)),
+            audio_event_lost_packet=bool(data.get("audio_event_lost_packet", True)),
             audio_file_good=str(data.get("audio_file_good") or defaults.audio_file_good),
             audio_file_warning=str(data.get("audio_file_warning") or defaults.audio_file_warning),
             audio_file_critical=str(data.get("audio_file_critical") or defaults.audio_file_critical),
             audio_file_lost_packet=str(
                 data.get("audio_file_lost_packet") or defaults.audio_file_lost_packet
             ),
+            audio_alert_targets=audio_targets,
         )
 
     def save(self, path: Path | None = None) -> None:
         path = path or default_prefs_path()
         path.parent.mkdir(parents=True, exist_ok=True)
+        targets = self.audio_alert_targets
         path.write_text(
             json.dumps(
                 {
@@ -270,12 +305,21 @@ class Preferences:
                     "host_ip_width": self.host_ip_width,
                     "host_hostname_width": self.host_hostname_width,
                     "host_ports_width": self.host_ports_width,
+                    "band_green_max_ms": self.band_green_max_ms,
+                    "band_yellow_max_ms": self.band_yellow_max_ms,
                     "audio_alerts_enabled": self.audio_alerts_enabled,
                     "audio_on_band_change_only": self.audio_on_band_change_only,
+                    "audio_event_good": self.audio_event_good,
+                    "audio_event_warning": self.audio_event_warning,
+                    "audio_event_critical": self.audio_event_critical,
+                    "audio_event_lost_packet": self.audio_event_lost_packet,
                     "audio_file_good": self.audio_file_good,
                     "audio_file_warning": self.audio_file_warning,
                     "audio_file_critical": self.audio_file_critical,
                     "audio_file_lost_packet": self.audio_file_lost_packet,
+                    "audio_alert_targets": (
+                        None if targets is None else sorted(targets)
+                    ),
                 },
                 indent=2,
             )
@@ -286,11 +330,19 @@ class Preferences:
     def notification_settings(self):
         from .notifications import NotificationSettings
 
+        targets = self.audio_alert_targets
         return NotificationSettings(
             enabled=self.audio_alerts_enabled,
             on_band_change_only=self.audio_on_band_change_only,
+            event_good=self.audio_event_good,
+            event_warning=self.audio_event_warning,
+            event_critical=self.audio_event_critical,
+            event_lost_packet=self.audio_event_lost_packet,
             sound_good=self.audio_file_good,
             sound_warning=self.audio_file_warning,
             sound_critical=self.audio_file_critical,
             sound_lost_packet=self.audio_file_lost_packet,
+            armed_targets=None if targets is None else set(targets),
         )
+
+

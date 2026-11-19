@@ -87,13 +87,65 @@ def loss_percent(sent: int, received: int) -> float:
     return (sent - received) * 100.0 / sent
 
 
-def latency_band(ms: float | None) -> str:
-    """PingPlotter-style bands: green 0-100, yellow 101-200, red 201+."""
+DEFAULT_BAND_GREEN_MS = 100.0
+DEFAULT_BAND_YELLOW_MS = 200.0
+
+
+@dataclass(frozen=True)
+class BandThresholds:
+    """Latency coloring / alert bands (green ≤ green_max < yellow ≤ yellow_max < red)."""
+
+    green_max_ms: float = DEFAULT_BAND_GREEN_MS
+    yellow_max_ms: float = DEFAULT_BAND_YELLOW_MS
+
+    def normalized(self) -> BandThresholds:
+        green = max(1.0, float(self.green_max_ms))
+        yellow = max(green + 1.0, float(self.yellow_max_ms))
+        return BandThresholds(green_max_ms=green, yellow_max_ms=yellow)
+
+    def legend_labels(self) -> tuple[str, str, str]:
+        g = int(round(self.green_max_ms))
+        y = int(round(self.yellow_max_ms))
+        return (f"0–{g} ms", f"{g + 1}–{y} ms", f"{y + 1}+ ms")
+
+
+_current_bands = BandThresholds()
+
+
+def current_band_thresholds() -> BandThresholds:
+    return _current_bands
+
+
+def set_band_thresholds(
+    green_max_ms: float | None = None,
+    yellow_max_ms: float | None = None,
+) -> BandThresholds:
+    """Update the process-wide green/yellow cutoffs used by graphs and alerts."""
+    global _current_bands
+    current = _current_bands
+    _current_bands = BandThresholds(
+        green_max_ms=current.green_max_ms if green_max_ms is None else green_max_ms,
+        yellow_max_ms=current.yellow_max_ms if yellow_max_ms is None else yellow_max_ms,
+    ).normalized()
+    return _current_bands
+
+
+def latency_band(
+    ms: float | None,
+    green_max_ms: float | None = None,
+    yellow_max_ms: float | None = None,
+) -> str:
+    """Latency bands: green ≤ green_max, yellow ≤ yellow_max, else red (None → none)."""
     if ms is None:
         return "none"
-    if ms <= 100:
+    bands = current_band_thresholds()
+    green = bands.green_max_ms if green_max_ms is None else float(green_max_ms)
+    yellow = bands.yellow_max_ms if yellow_max_ms is None else float(yellow_max_ms)
+    if yellow <= green:
+        yellow = green + 1.0
+    if ms <= green:
         return "green"
-    if ms <= 200:
+    if ms <= yellow:
         return "yellow"
     return "red"
 

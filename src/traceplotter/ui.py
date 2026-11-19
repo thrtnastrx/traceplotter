@@ -23,6 +23,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -62,6 +63,7 @@ from .engine import (
     SampleStore,
     SubnetSweeper,
     TimelinePoint,
+    current_band_thresholds,
     expand_ipv4_spec,
     format_open_ports,
     latency_band,
@@ -69,12 +71,14 @@ from .engine import (
     parse_port_spec,
     resolve_ipv4,
     reverse_dns,
+    set_band_thresholds,
 )
 from .banner import DualBanner, PaneShell, ToolbarChip, default_panes_path
 from .hostnames import HostnameBook
 from .scans import ScanLibrary, probe_results_from_saved
 from . import app_version
 from .notifications import (
+    AUDIO_INDICATOR,
     EVENT_CRITICAL,
     EVENT_GOOD,
     EVENT_LOST,
@@ -325,10 +329,11 @@ class FocusChart(QWidget):
             250.0,
             max((h.last_ms or h.avg_ms or 0.0) for h in self._hops) * 1.1,
         )
+        bands = current_band_thresholds()
         for color, lo, hi in (
-            (theme.green_soft, 0, 100),
-            (theme.yellow_soft, 100, 200),
-            (theme.red_soft, 200, max_ms),
+            (theme.green_soft, 0.0, bands.green_max_ms),
+            (theme.yellow_soft, bands.green_max_ms, bands.yellow_max_ms),
+            (theme.red_soft, bands.yellow_max_ms, max_ms),
         ):
             x0 = body.left() + body.width() * lo / max_ms
             x1 = body.left() + body.width() * min(hi, max_ms) / max_ms
@@ -538,10 +543,11 @@ class TimelineChart(QWidget):
         valid = [(p.timestamp, p.latency_ms) for p in points if p.latency_ms is not None]
         if valid:
             max_ms = max(250.0, max(value for _, value in valid) * 1.15)
+        bands = current_band_thresholds()
         for color, lo, hi in (
-            (theme.green_soft, 0, 100),
-            (theme.yellow_soft, 100, 200),
-            (theme.red_soft, 200, max_ms),
+            (theme.green_soft, 0.0, bands.green_max_ms),
+            (theme.yellow_soft, bands.green_max_ms, bands.yellow_max_ms),
+            (theme.red_soft, bands.yellow_max_ms, max_ms),
         ):
             y1 = area.bottom() - area.height() * min(hi, max_ms) / max_ms
             y0 = area.bottom() - area.height() * lo / max_ms
@@ -1090,7 +1096,6 @@ class OptionsDialog(QDialog):
     def __init__(self, prefs: Preferences, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Options")
-        self.resize(520, 500)
         self.prefs = prefs
         self._player = AlertPlayer()
 
@@ -1107,29 +1112,106 @@ class OptionsDialog(QDialog):
         form = QFormLayout()
         form.addRow("Theme", theme_box)
 
+        self.band_green = QDoubleSpinBox()
+        self.band_green.setRange(1.0, 10_000.0)
+        self.band_green.setDecimals(0)
+        self.band_green.setSuffix(" ms")
+        self.band_green.setValue(prefs.band_green_max_ms)
+        self.band_green.setToolTip("Latency at or below this value is green / Good")
+        self.band_yellow = QDoubleSpinBox()
+        self.band_yellow.setRange(2.0, 20_000.0)
+        self.band_yellow.setDecimals(0)
+        self.band_yellow.setSuffix(" ms")
+        self.band_yellow.setValue(prefs.band_yellow_max_ms)
+        self.band_yellow.setToolTip(
+            "Latency above green and at or below this value is yellow / Warning; above is red / Critical"
+        )
+        band_form = QFormLayout()
+        band_form.addRow("Green (Good) ≤", self.band_green)
+        band_form.addRow("Yellow (Warning) ≤", self.band_yellow)
+        band_form.addRow(QLabel("Red (Critical) = above yellow"))
+        band_box = QGroupBox("Time graph latency bands")
+        band_box.setToolTip(
+            "These cutoffs color the time graph, hop circles, and focus bars, and drive audio alert bands."
+        )
+        band_box.setLayout(band_form)
+        self.band_green.valueChanged.connect(self._band_thresholds_changed)
+        self.band_yellow.valueChanged.connect(self._band_thresholds_changed)
+
         self.audio_enabled = QCheckBox("Play audio alerts")
         self.audio_enabled.setChecked(prefs.audio_alerts_enabled)
         self.audio_enabled.setToolTip(
-            "PingPlotter-style endpoint sounds for good / warning / critical latency and lost packets."
+            "Master switch for PingPlotter-style endpoint sounds. "
+            "Defaults to all targets; use the buttons below or the host-list right-click menu to limit which hosts alert."
         )
-        self.audio_on_change = QCheckBox("Only when the latency band changes")
-        self.audio_on_change.setChecked(prefs.audio_on_band_change_only)
+        self.audio_every_event = QRadioButton(
+            "For each triggered event (every matching green / yellow / red / lost sample)"
+        )
+        self.audio_every_event.setToolTip(
+            "Play the matching sound on every sample that falls in an enabled band."
+        )
+        self.audio_on_change = QRadioButton(
+            "Only when change detected (play once when a host moves between green / yellow / red / lost)"
+        )
         self.audio_on_change.setToolTip(
-            "When checked, play once when the destination moves between good/warning/critical/lost. "
-            "When unchecked, play on every sample."
+            "Play once when the destination band changes (for example green→yellow or red→green). "
+            "Warning / critical / lost also play on the first sample if the host starts there."
         )
+        self.audio_trigger_group = QButtonGroup(self)
+        self.audio_trigger_group.addButton(self.audio_every_event)
+        self.audio_trigger_group.addButton(self.audio_on_change)
+        if prefs.audio_on_band_change_only:
+            self.audio_on_change.setChecked(True)
+        else:
+            self.audio_every_event.setChecked(True)
+        trigger_box = QVBoxLayout()
+        trigger_box.setContentsMargins(0, 0, 0, 0)
+        trigger_box.setSpacing(4)
+        trigger_box.addWidget(self.audio_every_event)
+        trigger_box.addWidget(self.audio_on_change)
+        trigger_wrap = QWidget()
+        trigger_wrap.setLayout(trigger_box)
+        self.event_good = QCheckBox("Good")
+        self.event_good.setChecked(prefs.audio_event_good)
+        self.event_warning = QCheckBox("Warning")
+        self.event_warning.setChecked(prefs.audio_event_warning)
+        self.event_critical = QCheckBox("Critical")
+        self.event_critical.setChecked(prefs.audio_event_critical)
+        self.event_lost = QCheckBox("Lost packet")
+        self.event_lost.setChecked(prefs.audio_event_lost_packet)
         self.sound_good = self._sound_combo(prefs.audio_file_good)
         self.sound_warning = self._sound_combo(prefs.audio_file_warning)
         self.sound_critical = self._sound_combo(prefs.audio_file_critical)
         self.sound_lost = self._sound_combo(prefs.audio_file_lost_packet)
+        self._sync_event_band_labels()
 
         audio_form = QFormLayout()
         audio_form.addRow(self.audio_enabled)
-        audio_form.addRow(self.audio_on_change)
-        audio_form.addRow(self._sound_row("Good (0–100 ms)", self.sound_good, EVENT_GOOD))
-        audio_form.addRow(self._sound_row("Warning (101–200 ms)", self.sound_warning, EVENT_WARNING))
-        audio_form.addRow(self._sound_row("Critical (201+ ms)", self.sound_critical, EVENT_CRITICAL))
-        audio_form.addRow(self._sound_row("Lost packet", self.sound_lost, EVENT_LOST))
+        audio_form.addRow(trigger_wrap)
+        audio_form.addRow(
+            self._sound_row(self.event_good, self.sound_good, EVENT_GOOD)
+        )
+        audio_form.addRow(
+            self._sound_row(self.event_warning, self.sound_warning, EVENT_WARNING)
+        )
+        audio_form.addRow(
+            self._sound_row(self.event_critical, self.sound_critical, EVENT_CRITICAL)
+        )
+        audio_form.addRow(
+            self._sound_row(self.event_lost, self.sound_lost, EVENT_LOST)
+        )
+        arm_row = QHBoxLayout()
+        enable_all = QPushButton("Enable on all targets")
+        enable_all.setToolTip("Arm audio alerts for every host currently in the list")
+        enable_all.clicked.connect(self._enable_audio_all_targets)
+        clear_all = QPushButton("Remove from all targets")
+        clear_all.setToolTip("Disarm audio alerts for every host")
+        clear_all.clicked.connect(self._clear_audio_all_targets)
+        arm_row.addWidget(enable_all)
+        arm_row.addWidget(clear_all)
+        arm_row.addStretch()
+        audio_form.addRow(arm_row)
+        self._audio_arm_buttons = (enable_all, clear_all)
         audio_box = QGroupBox("Notifications (PingPlotter alert audio)")
         audio_box.setLayout(audio_form)
         self.audio_enabled.toggled.connect(self._audio_controls_enabled)
@@ -1153,6 +1235,7 @@ class OptionsDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.addLayout(form)
+        layout.addWidget(band_box)
         layout.addWidget(audio_box)
         layout.addLayout(extras)
         layout.addStretch()
@@ -1160,6 +1243,7 @@ class OptionsDialog(QDialog):
 
         self.light.toggled.connect(self._preview_theme)
         self.dark.toggled.connect(self._preview_theme)
+        self.resize(520, 620)
 
     def _sound_combo(self, selected: str) -> QComboBox:
         combo = QComboBox()
@@ -1171,18 +1255,21 @@ class OptionsDialog(QDialog):
         combo.setCurrentIndex(max(0, index))
         return combo
 
-    def _sound_row(self, label: str, combo: QComboBox, event: str) -> QWidget:
+    def _sound_row(self, enable: QCheckBox, combo: QComboBox, event: str) -> QWidget:
         row = QWidget()
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(QLabel(label))
+        layout.addWidget(enable)
         layout.addWidget(combo, 1)
         test = QPushButton("Test")
         test.clicked.connect(lambda: self._test_sound(combo, event))
         layout.addWidget(test)
+        enable.toggled.connect(combo.setEnabled)
+        combo.setEnabled(enable.isChecked())
         return row
 
     def _test_sound(self, combo: QComboBox, event: str) -> None:
+        del event
         filename = str(combo.currentData() or "")
         if not self._player.play_file(filename):
             QMessageBox.warning(
@@ -1191,23 +1278,65 @@ class OptionsDialog(QDialog):
                 f"Could not play {filename}. Ensure the alert audio files are installed.",
             )
 
+    def _band_thresholds_changed(self, *_args) -> None:
+        green = self.band_green.value()
+        if self.band_yellow.value() <= green:
+            self.band_yellow.blockSignals(True)
+            self.band_yellow.setValue(green + 1.0)
+            self.band_yellow.blockSignals(False)
+        self._sync_event_band_labels()
+
+    def _sync_event_band_labels(self) -> None:
+        green = int(round(self.band_green.value()))
+        yellow = int(round(max(self.band_yellow.value(), green + 1)))
+        self.event_good.setText(f"Good (0–{green} ms)")
+        self.event_warning.setText(f"Warning ({green + 1}–{yellow} ms)")
+        self.event_critical.setText(f"Critical ({yellow + 1}+ ms)")
+
     def _audio_controls_enabled(self, enabled: bool) -> None:
         for widget in (
+            self.audio_every_event,
             self.audio_on_change,
-            self.sound_good,
-            self.sound_warning,
-            self.sound_critical,
-            self.sound_lost,
+            self.event_good,
+            self.event_warning,
+            self.event_critical,
+            self.event_lost,
+            *self._audio_arm_buttons,
         ):
             widget.setEnabled(enabled)
+        self.sound_good.setEnabled(enabled and self.event_good.isChecked())
+        self.sound_warning.setEnabled(enabled and self.event_warning.isChecked())
+        self.sound_critical.setEnabled(enabled and self.event_critical.isChecked())
+        self.sound_lost.setEnabled(enabled and self.event_lost.isChecked())
+
+    def _enable_audio_all_targets(self) -> None:
+        parent = self.parent()
+        if isinstance(parent, MainWindow):
+            # Empty selection → all-targets mode (including hosts added later).
+            parent.set_audio_alerts_for_targets([], enabled=True)
+            self.prefs.audio_alerts_enabled = True
+            self.audio_enabled.setChecked(True)
+
+    def _clear_audio_all_targets(self) -> None:
+        parent = self.parent()
+        if isinstance(parent, MainWindow):
+            parent.set_audio_alerts_for_targets(list(parent.tracers), enabled=False)
 
     def selected_theme(self) -> str:
         return "dark" if self.dark.isChecked() else "light"
 
     def apply_to_prefs(self, prefs: Preferences) -> None:
         prefs.theme = self.selected_theme()
+        green = max(1.0, self.band_green.value())
+        yellow = max(green + 1.0, self.band_yellow.value())
+        prefs.band_green_max_ms = green
+        prefs.band_yellow_max_ms = yellow
         prefs.audio_alerts_enabled = self.audio_enabled.isChecked()
         prefs.audio_on_band_change_only = self.audio_on_change.isChecked()
+        prefs.audio_event_good = self.event_good.isChecked()
+        prefs.audio_event_warning = self.event_warning.isChecked()
+        prefs.audio_event_critical = self.event_critical.isChecked()
+        prefs.audio_event_lost_packet = self.event_lost.isChecked()
         prefs.audio_file_good = str(self.sound_good.currentData() or prefs.audio_file_good)
         prefs.audio_file_warning = str(self.sound_warning.currentData() or prefs.audio_file_warning)
         prefs.audio_file_critical = str(self.sound_critical.currentData() or prefs.audio_file_critical)
@@ -1234,6 +1363,7 @@ class MainWindow(QMainWindow):
         self.resize(1280, 780)
         self.prefs = Preferences.load()
         set_theme(self.prefs.theme)
+        set_band_thresholds(self.prefs.band_green_max_ms, self.prefs.band_yellow_max_ms)
         self.hostnames = HostnameBook()
         self.store = SampleStore(hostname_lookup=self.hostnames.resolve)
         self.trace_library = TraceLibrary()
@@ -1348,7 +1478,7 @@ class MainWindow(QMainWindow):
         self.targets.setShowGrid(False)
         self.targets.setAlternatingRowColors(True)
         self.targets.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.targets.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.targets.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.targets.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.targets.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.targets.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -1400,27 +1530,27 @@ class MainWindow(QMainWindow):
         self.time_window.currentIndexChanged.connect(self._time_window_changed)
         self.chart.set_window(int(self.time_window.currentData()), self.time_window.currentText())
 
-        legend = QWidget()
-        legend.setObjectName("latencyLegend")
-        legend_row = QHBoxLayout(legend)
+        self.legend = QWidget()
+        self.legend.setObjectName("latencyLegend")
+        self._legend_labels: list[QLabel] = []
+        legend_row = QHBoxLayout(self.legend)
         legend_row.setContentsMargins(6, 2, 6, 2)
         legend_row.setSpacing(8)
-        for color, label in (
-            ("#7ac943", "0–100 ms"),
-            ("#f5c542", "101–200 ms"),
-            ("#e85d5d", "201+ ms"),
-        ):
+        for color in ("#7ac943", "#f5c542", "#e85d5d"):
             swatch = QLabel("●")
             swatch.setStyleSheet(f"QLabel {{ color: {color}; font-size: 16px; background: transparent; }}")
             legend_row.addWidget(swatch)
-            legend_row.addWidget(QLabel(label))
+            text = QLabel("")
+            self._legend_labels.append(text)
+            legend_row.addWidget(text)
+        self._refresh_band_legend()
 
         chart_header = QWidget()
         chart_header.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         chart_header_row = QHBoxLayout(chart_header)
         chart_header_row.setContentsMargins(0, 0, 0, 0)
         chart_header_row.addWidget(QLabel("Time graph"))
-        chart_header_row.addWidget(legend)
+        chart_header_row.addWidget(self.legend)
         chart_header_row.addStretch()
         chart_header_row.addWidget(QLabel("Show"))
         chart_header_row.addWidget(self.time_window)
@@ -1465,10 +1595,33 @@ class MainWindow(QMainWindow):
         self._build_menus()
         self.apply_theme(self.prefs.theme)
         self.set_layout_edit(False)
-        self.statusBar().showMessage(
-            "Ready — continuous traceroute samples (green ≤100 ms, yellow ≤200, red 201+)."
-        )
+        self.statusBar().showMessage(self._ready_status_message())
         self._refresh_trace_history()
+
+    def _ready_status_message(self) -> str:
+        bands = current_band_thresholds()
+        g = int(round(bands.green_max_ms))
+        y = int(round(bands.yellow_max_ms))
+        return (
+            f"Ready — continuous traceroute samples "
+            f"(green ≤{g} ms, yellow ≤{y}, red {y + 1}+)."
+        )
+
+    def _refresh_band_legend(self) -> None:
+        green, yellow, red = current_band_thresholds().legend_labels()
+        for label, text in zip(self._legend_labels, (green, yellow, red), strict=True):
+            label.setText(text)
+
+    def apply_band_thresholds(self) -> None:
+        set_band_thresholds(self.prefs.band_green_max_ms, self.prefs.band_yellow_max_ms)
+        self.alert_player.reset_target()
+        self._refresh_band_legend()
+        self.focus.update()
+        self.chart.update()
+        self.table.viewport().update()
+        current = self._current_target()
+        if current:
+            self.refresh(current)
 
     def _build_menus(self) -> None:
         """App menu bar; on macOS About/Options move into the TracePlotter application menu."""
@@ -1510,12 +1663,92 @@ class MainWindow(QMainWindow):
             dialog.apply_to_prefs(self.prefs)
             self.prefs.save()
             self.apply_theme(self.prefs.theme)
+            self.apply_band_thresholds()
+            self._paint_target_statuses()
             note = "on" if self.prefs.audio_alerts_enabled else "off"
+            if self.prefs.audio_alert_targets is None:
+                scope = "all targets"
+            elif not self.prefs.audio_alert_targets:
+                scope = "no targets"
+            else:
+                scope = f"{len(self.prefs.audio_alert_targets)} target(s)"
+            bands = current_band_thresholds()
             self.statusBar().showMessage(
-                f"Options saved — theme {THEMES[self.prefs.theme].label}, audio alerts {note}."
+                f"Options saved — theme {THEMES[self.prefs.theme].label}, "
+                f"bands ≤{int(bands.green_max_ms)}/≤{int(bands.yellow_max_ms)} ms, "
+                f"audio alerts {note} ({scope})."
             )
         else:
             self.apply_theme(previous)
+            self.apply_band_thresholds()
+
+    def audio_alerts_all_targets(self) -> bool:
+        return self.prefs.audio_alert_targets is None
+
+    def target_audio_armed(self, target: str) -> bool:
+        if not target or not self.prefs.audio_alerts_enabled:
+            return False
+        if self.prefs.audio_alert_targets is None:
+            return True
+        return target in self.prefs.audio_alert_targets
+
+    def set_audio_alerts_for_targets(
+        self,
+        targets: Iterable[str],
+        *,
+        enabled: bool,
+    ) -> None:
+        keys = [str(target).strip() for target in targets if str(target).strip()]
+        known = [str(t).strip() for t in self.tracers if str(t).strip()]
+        if enabled:
+            if not keys:
+                # Enable on all current (and future) targets.
+                self.prefs.audio_alert_targets = None
+            elif self.prefs.audio_alert_targets is None:
+                # Already all-targets mode.
+                pass
+            else:
+                armed = set(self.prefs.audio_alert_targets)
+                armed.update(keys)
+                # If every known host is armed, collapse back to all-targets.
+                if known and all(host in armed for host in known):
+                    self.prefs.audio_alert_targets = None
+                else:
+                    self.prefs.audio_alert_targets = sorted(armed)
+            if not self.prefs.audio_alerts_enabled:
+                self.prefs.audio_alerts_enabled = True
+            self.prefs.save()
+            self._paint_target_statuses()
+            if self.prefs.audio_alert_targets is None:
+                self.statusBar().showMessage("Audio alerts enabled on all targets.")
+            else:
+                self.statusBar().showMessage(f"Audio alerts enabled on {len(keys)} target(s).")
+            return
+
+        # Disarm selected targets.
+        if not keys and not known:
+            self.prefs.audio_alert_targets = []
+            self.prefs.save()
+            self._paint_target_statuses()
+            self.statusBar().showMessage("Audio alerts removed from all targets.")
+            return
+        if self.prefs.audio_alert_targets is None:
+            armed = set(known) if known else set(keys)
+        else:
+            armed = set(self.prefs.audio_alert_targets)
+        for target in keys or known:
+            armed.discard(target)
+            self.alert_player.reset_target(target)
+        self.prefs.audio_alert_targets = sorted(armed)
+        self.prefs.save()
+        self._paint_target_statuses()
+        removed = len(keys) if keys else len(known)
+        self.statusBar().showMessage(f"Audio alerts removed from {removed} target(s).")
+
+    def _ip_display_text(self, display_ip: str, target: str) -> str:
+        if self.target_audio_armed(target):
+            return f"{AUDIO_INDICATOR} {display_ip}"
+        return display_ip
 
     def set_layout_edit(self, enabled: bool) -> None:
         self._layout_edit = enabled
@@ -1738,9 +1971,11 @@ class MainWindow(QMainWindow):
             | Qt.ItemFlag.ItemIsDragEnabled
             | Qt.ItemFlag.ItemIsDropEnabled
         )
-        ip_item = QTableWidgetItem(display_ip)
+        ip_item = QTableWidgetItem(self._ip_display_text(display_ip, target))
         ip_item.setData(Qt.ItemDataRole.UserRole, target)
         ip_item.setFlags(drag_flags)
+        if self.target_audio_armed(target):
+            ip_item.setToolTip("Audio alerts armed for this target")
         host_item = QTableWidgetItem(name)
         host_item.setFlags(drag_flags)
         ports_item = QTableWidgetItem(ports_text)
@@ -1757,6 +1992,16 @@ class MainWindow(QMainWindow):
         self.targets.setRowHeight(row, 24)
         return row
 
+    @staticmethod
+    def _strip_audio_indicator(text: str) -> str:
+        value = text.strip()
+        prefix = f"{AUDIO_INDICATOR} "
+        if value.startswith(prefix):
+            return value[len(prefix) :].strip()
+        if value.startswith(AUDIO_INDICATOR):
+            return value[len(AUDIO_INDICATOR) :].strip()
+        return value
+
     def _target_key(self, item: QTableWidgetItem | None) -> str:
         if item is None:
             return ""
@@ -1765,12 +2010,24 @@ class MainWindow(QMainWindow):
             return str(key)
         # IP column text, or pair with column 0 when hostname cell is selected.
         if item.column() == 0:
-            return item.text().strip()
+            return self._strip_audio_indicator(item.text())
         ip_item = self.targets.item(item.row(), 0)
         if ip_item is not None:
             key = ip_item.data(Qt.ItemDataRole.UserRole)
-            return str(key) if key else ip_item.text().strip()
+            if key:
+                return str(key)
+            return self._strip_audio_indicator(ip_item.text())
         return ""
+
+    def _selected_targets(self) -> list[str]:
+        keys: list[str] = []
+        seen: set[str] = set()
+        for index in self.targets.selectionModel().selectedRows():
+            target = self._target_key_at(index.row())
+            if target and target not in seen:
+                seen.add(target)
+                keys.append(target)
+        return keys
 
     def _target_key_at(self, row: int) -> str:
         return self._target_key(self.targets.item(row, 0))
@@ -1927,6 +2184,10 @@ class MainWindow(QMainWindow):
         self.alert_player.reset_target()
         self.store.reset()
         self.targets.setRowCount(0)
+        # Keep all-targets audio mode; drop a stale explicit host list.
+        if self.prefs.audio_alert_targets is not None:
+            self.prefs.audio_alert_targets = None if self.prefs.audio_alerts_enabled else []
+            self.prefs.save()
         self.refresh("")
         self.statusBar().showMessage(f"Cleared {count} target(s).")
 
@@ -2053,8 +2314,15 @@ class MainWindow(QMainWindow):
     def _target_context_menu(self, pos: QPoint) -> None:
         menu = QMenu(self)
         item = self.targets.itemAt(pos)
-        target = self._target_key(item) if item is not None else ""
-        if target:
+        clicked = self._target_key(item) if item is not None else ""
+        selected = self._selected_targets()
+        if clicked and clicked not in selected:
+            # Right-click outside the current multi-selection → operate on that row.
+            self.targets.selectRow(item.row())
+            selected = [clicked]
+        targets = selected or ([clicked] if clicked else [])
+        if len(targets) == 1:
+            target = targets[0]
             set_action = QAction("Set hostname…", self)
             set_action.triggered.connect(lambda: self._set_hostname_for_target(target))
             menu.addAction(set_action)
@@ -2062,6 +2330,24 @@ class MainWindow(QMainWindow):
                 clear_action = QAction("Clear manual hostname", self)
                 clear_action.triggered.connect(lambda: self._clear_hostname_for_target(target))
                 menu.addAction(clear_action)
+            menu.addSeparator()
+        if targets:
+            armed = [t for t in targets if self.target_audio_armed(t)]
+            label_suffix = (
+                f" ({len(targets)} targets)" if len(targets) > 1 else ""
+            )
+            enable_audio = QAction(f"Enable audio alerts{label_suffix}", self)
+            enable_audio.setEnabled(len(armed) < len(targets) or not self.prefs.audio_alerts_enabled)
+            enable_audio.triggered.connect(
+                lambda: self.set_audio_alerts_for_targets(targets, enabled=True)
+            )
+            menu.addAction(enable_audio)
+            disable_audio = QAction(f"Disable audio alerts{label_suffix}", self)
+            disable_audio.setEnabled(bool(armed))
+            disable_audio.triggered.connect(
+                lambda: self.set_audio_alerts_for_targets(targets, enabled=False)
+            )
+            menu.addAction(disable_audio)
             menu.addSeparator()
         menu.addAction(self.action_hide_unresponsive)
         sort_menu = menu.addMenu("Sort hosts")
@@ -2151,8 +2437,13 @@ class MainWindow(QMainWindow):
                 | Qt.ItemFlag.ItemIsDragEnabled
                 | Qt.ItemFlag.ItemIsDropEnabled
             )
-            ip_item.setText(display_ip)
+            ip_item.setText(self._ip_display_text(display_ip, target))
+            ip_item.setData(Qt.ItemDataRole.UserRole, target)
             ip_item.setFlags(drag_flags)
+            if self.target_audio_armed(target):
+                ip_item.setToolTip("Audio alerts armed — ♪ shows this target can trigger sounds")
+            else:
+                ip_item.setToolTip("")
             if host_item is None:
                 host_item = QTableWidgetItem(name)
                 host_item.setFlags(drag_flags)
